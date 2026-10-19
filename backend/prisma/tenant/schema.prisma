@@ -1,0 +1,2594 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// ---------------------------------------------------------------------------
+// TENANT-SCOPED BUSINESS DATA — deployed unmodified into every tenant_<slug>
+// schema (one physical Postgres schema per MSME tenant). Isolation here is
+// structural: which schema a Prisma connection targets, never a row-level
+// tenantId column. Models in this datamodel must never gain a tenantId field.
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client"
+  output   = "../../src/generated/tenant"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Inventory valuation uses WEIGHTED AVERAGE COST only (Task 3.1), not FIFO.
+// TechSpec §6.4.1 lists both, but FIFO requires per-layer cost tracking that
+// doubles the movement model and complicates every partial-consumption path,
+// for an accuracy difference immaterial to an MSME's statements. avgCost is
+// recomputed on every valued stock-in; stockValue = stockCount * avgCost.
+/// Task T-A8. Every product created before 0027 is a GOOD (NULL-free default): that is
+/// what each of them was.
+enum ProductType {
+  GOOD
+  SERVICE
+}
+
+model Product {
+  id String @id @default(uuid())
+
+  // Catalog identity (§6.4.1 Inventory Management — Product master)
+  sku           String  @unique
+  barcode       String? @unique
+  name          String
+  description   String?
+  category      String?
+  unitOfMeasure String  @default("unit")
+  imageUrl      String?
+
+  // Pricing — stored as BigInt KES cents (minor units), never Decimal or float.
+  costPrice BigInt // KES cents (minor units)
+  price     BigInt // KES cents (minor units)
+  /// THE PRODUCT'S VAT STATUS (Task 3B.1) — the source of truth, replacing the old
+  /// per-product `taxRate`. The rate a sale applies is DERIVED at sale time from this
+  /// class, the tenant's VAT registration and the effective
+  /// `StatutorySchedule.vatStandardRate`; no rate is stored on the product, so a
+  /// finance-act change is one dated schedule row rather than an edit to every product.
+  taxClass  TaxClass @default(STANDARD_RATED)
+
+  /// WHAT the product is (Task T-A8). A GOOD is stock: it is received, held, valued and
+  /// depleted through the inventory service. A SERVICE carries no stock at all — a sale
+  /// line for it posts revenue, VAT and TOT and NOTHING on the cost side (no movement, no
+  /// COGS, no 1200). CHECK-pinned in 0027 (a SERVICE holds no stock) and FROZEN once
+  /// created, because a void reads it to decide whether a line has stock to return.
+  kind      ProductType @default(GOOD)
+
+  // Stock counts & thresholds (§6.4.1 reorder alerts)
+  stockCount        Decimal  @default(0) @db.Decimal(14, 3)
+  minStockThreshold Decimal  @default(0) @db.Decimal(14, 3)
+  reorderQuantity   Decimal? @db.Decimal(14, 3)
+
+  // Weighted-average valuation. Only src/services/inventory.ts may mutate these.
+  // INVARIANT (Task 10.1): stockCount is the TENANT-WIDE aggregate and always
+  // equals SUM(ProductLocationStock.quantity) for this product. It is NOT
+  // replaced by the per-location split — ProductLocationStock holds the split,
+  // this column holds the total. A transfer between locations moves the split
+  // and leaves this column (and stockValue) untouched.
+  //
+  // VALUATION HIERARCHY (Task 3.1-FIX). stockValue is the AUTHORITATIVE
+  // carrying amount: it moves only by the exact posted delta of a movement and
+  // is NEVER recomputed as stockCount * avgCost. avgCost is a DERIVED CACHE —
+  // roundHalfUp(stockValue / stockCount) refreshed on every write, kept for
+  // display and for the movement history — and may never feed back into
+  // stockValue. ZERO INVARIANT: stockCount = 0 implies stockValue = 0 (CHECK in
+  // migration 0012). The converse is NOT enforced: donated stock is legitimately
+  // positive quantity at zero cost.
+  avgCost    BigInt @default(0) // KES cents, DERIVED cache of stockValue / stockCount
+  stockValue BigInt @default(0) // KES cents, AUTHORITATIVE carrying value
+
+  // Batch/expiry tracking — critical for food, pharma, chemical MSMEs
+  batchTracked Boolean   @default(false)
+  expiryDate   DateTime? @db.Timestamptz(3)
+
+  isActive Boolean @default(true)
+
+  supplierId String?
+  supplier   Supplier? @relation(fields: [supplierId], references: [id])
+
+  movements          StockMovement[]
+  saleLines          SaleLine[]
+  locationStock      ProductLocationStock[]
+  allocationRequests AllocationRequest[]
+  purchaseOrderLines PurchaseOrderLine[]
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([category])
+  @@map("products")
+}
+
+// ---------------------------------------------------------------------------
+// Chart of Accounts (§6.5.1). Reference data the General Ledger Engine (Task
+// 2.2) posts against. Statement structure derives from accountClass and code
+// ordering — there is deliberately no parent/hierarchy field at MVP.
+// ---------------------------------------------------------------------------
+
+enum AccountClass {
+  ASSET
+  LIABILITY
+  EQUITY
+  REVENUE
+  COST_OF_SALES
+  EXPENSE
+}
+
+enum NormalBalance {
+  DEBIT
+  CREDIT
+}
+
+model Account {
+  id            String        @id @default(uuid())
+  code          String        @unique // 4-digit, class-ranged
+  name          String
+  accountClass  AccountClass
+  normalBalance NormalBalance
+  description   String?
+  isSystem      Boolean       @default(false) // seeded; cannot be renamed or deleted
+  isActive      Boolean       @default(true)
+  createdAt     DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime      @updatedAt @db.Timestamptz(3)
+
+  journalLines JournalLine[]
+  billLines    SupplierBillLine[]
+
+  @@index([accountClass])
+  @@map("accounts")
+}
+
+// ---------------------------------------------------------------------------
+// Double-Entry General Ledger Engine (Module 5, Task 2.2). Every financial
+// transaction posts here as a balanced journal entry. The real guarantees
+// (balance, immutability, period lock, chart protection) are enforced by
+// hand-written DDL in migration 0003 — the DB makes invalid states
+// unrepresentable so a buggy future module cannot corrupt the books.
+// ---------------------------------------------------------------------------
+
+enum PeriodStatus {
+  OPEN
+  CLOSED
+}
+
+enum JournalEntryStatus {
+  POSTED
+  REVERSED
+}
+
+// Deliberately no DRAFT. An entry that has not been posted does not exist; the
+// ledger is append-only and there is no editable intermediate state.
+
+enum JournalSource {
+  MANUAL
+  POS
+  SALE_RETURN
+  PURCHASE
+  PAYROLL
+  EXPENSE
+  INVENTORY_ADJUSTMENT
+  BANK_RECONCILIATION
+  OPENING_BALANCE
+  DEPRECIATION
+}
+
+model AccountingPeriod {
+  id        String       @id @default(uuid())
+  year      Int
+  month     Int          // 1-12
+  status    PeriodStatus @default(OPEN)
+  closedAt  DateTime? @db.Timestamptz(3)
+  closedBy  String? // platform user id
+  createdAt DateTime     @default(now()) @db.Timestamptz(3)
+
+  @@unique([year, month])
+  @@index([status])
+  @@map("accounting_periods")
+}
+
+model JournalEntry {
+  id          String             @id @default(uuid())
+  entryNumber String             @unique // JE-YYYYMM-000001
+  entryDate   DateTime           @db.Date
+  periodYear  Int
+  periodMonth Int
+  description String
+  reference   String?
+  source      JournalSource
+  sourceId    String? // POS transaction id, payroll run id, etc.
+  status      JournalEntryStatus @default(POSTED)
+
+  reversesEntryId   String? @unique // set on the reversing entry
+  reversedByEntryId String? @unique // set on the original when reversed
+
+  createdBy String // platform user id from the session
+  postedAt  DateTime @default(now()) @db.Timestamptz(3)
+
+  lines JournalLine[]
+
+  @@index([entryDate])
+  @@index([periodYear, periodMonth])
+  @@index([source, sourceId])
+  @@map("journal_entries")
+}
+
+model JournalLine {
+  id         String       @id @default(uuid())
+  entryId    String
+  entry      JournalEntry @relation(fields: [entryId], references: [id])
+  lineNumber Int
+  accountId  String
+  account    Account      @relation(fields: [accountId], references: [id])
+  debit      BigInt       @default(0) // KES cents
+  credit     BigInt       @default(0) // KES cents
+  memo       String?
+
+  @@unique([entryId, lineNumber])
+  @@index([accountId])
+  @@map("journal_lines")
+}
+
+// ---------------------------------------------------------------------------
+// Inventory & Procurement (Module 2 + part of Module 4, Task 3.1). Stock moves
+// are an append-only history; every valued movement posts a balanced journal
+// entry through src/services/ledger.ts so inventory value and the GL never
+// diverge. Only src/services/inventory.ts writes stock_movements or mutates a
+// product's stockCount / stockValue / avgCost.
+// ---------------------------------------------------------------------------
+
+enum StockMovementType {
+  PURCHASE_RECEIPT // goods in from a supplier
+  SALE // consumed by a POS sale (Task 3.2 will emit these)
+  SALE_RETURN // customer return, goods back in
+  PURCHASE_RETURN // returned to supplier
+  ADJUSTMENT_INCREASE // stock count correction, upward
+  ADJUSTMENT_DECREASE // stock count correction, downward
+  WRITE_OFF // damage, expiry, shrinkage
+  TRANSFER_IN
+  TRANSFER_OUT
+  OPENING_BALANCE
+}
+
+model Supplier {
+  id           String   @id @default(uuid())
+  name         String
+  contactName  String?
+  phone        String?
+  email        String?
+  kraPin       String?
+  paymentTerms String? // "Net 30", "Cash on delivery"
+  leadTimeDays Int?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @db.Timestamptz(3)
+
+  movements       StockMovement[]
+  products        Product[]
+  purchaseOrders  PurchaseOrder[]
+  bills           SupplierBill[]
+  payments        SupplierPayment[]
+
+  @@index([name])
+  @@map("suppliers")
+}
+
+model StockMovement {
+  id           String            @id @default(uuid())
+  productId    String
+  product      Product           @relation(fields: [productId], references: [id])
+  movementType StockMovementType
+
+  // Signed quantity: positive for stock in, negative for stock out. The sign is
+  // derived from movementType by the service and validated, never taken from
+  // the caller.
+  quantity  Decimal @db.Decimal(14, 3)
+  unitCost  BigInt // KES cents, cost per unit for this movement
+  totalCost BigInt // KES cents, |quantity| * unitCost, rounded
+
+  // Balances AFTER this movement, for audit reconstruction without replay.
+  balanceQty   Decimal @db.Decimal(14, 3)
+  balanceValue BigInt // KES cents
+  avgCostAfter BigInt // KES cents
+
+  supplierId String?
+  supplier   Supplier? @relation(fields: [supplierId], references: [id])
+  reference  String?
+  notes      String?
+
+  // Multi-location foundation plug (Module 10, deferred). Nullable so existing
+  // rows migrate cleanly; the provisioning/backfill seeds them to the default
+  // "Main" location and the service stamps every new movement with a location.
+  locationId String?
+  location   Location? @relation(fields: [locationId], references: [id])
+
+  // PROCUREMENT LINKS (Task 5.1). Both NULL means this movement did not come
+  // from a purchase order — an ad-hoc receipt, a sale, a transfer, an
+  // adjustment, a write-off. That is EVERY movement that existed before this
+  // migration, and nothing is backfilled: NULL is the truthful statement that no
+  // PO was involved (the NULL-means-default rule).
+  //
+  // A PURCHASE_RECEIPT created by a goods receipt carries BOTH: the GRN it was
+  // part of, and the PO line it fulfilled. That pairing is what lets Task 5.2
+  // match a supplier bill to what was actually received.
+  goodsReceiptId      String?
+  goodsReceipt        GoodsReceipt?      @relation(fields: [goodsReceiptId], references: [id])
+  purchaseOrderLineId String?
+  purchaseOrderLine   PurchaseOrderLine? @relation(fields: [purchaseOrderLineId], references: [id])
+
+  journalEntryId String? @unique // the GL entry this movement produced
+  createdBy      String
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+
+  // Back-relation for AllocationRequest.transferId (Task 10.2). An approved
+  // request points at the TRANSFER_IN movement that delivered its stock; this
+  // side exists only so Prisma can express the FK.
+  allocationRequests AllocationRequest[]
+
+  @@index([productId, createdAt])
+  @@index([movementType])
+  @@index([locationId])
+  @@index([goodsReceiptId])
+  @@index([purchaseOrderLineId])
+  @@map("stock_movements")
+}
+
+// ---------------------------------------------------------------------------
+// LOCATIONS (Module 10). One model, five types — MAIN, POS and ECOMMERCE are
+// functional today; BRANCH and ATTENDANT are THE SAME MODEL and need no schema
+// change to enable, only rows.
+//
+// Each location carries its own admin-set LEASE / SESSION POLICY (Task 10.2).
+// That policy is CONFIG THIS TASK STORES AND EXPOSES — nothing here expires a
+// lease or freezes anything. Lease ENFORCEMENT (expiry -> PENDING_RECONCILIATION
+// -> sync or admin write-off) belongs to the offline server task that follows,
+// and is deliberately absent: see the engineering ledger "Lease & Freeze Safety" and the
+// seam note at the top of src/services/locations.ts.
+// ---------------------------------------------------------------------------
+
+enum LocationType {
+  MAIN // the authoritative pool; exactly one per tenant, never offline-capable
+  POS // a till; offline-capable, so it may carry a lease window
+  ECOMMERCE // a storefront channel; always online, never leases
+  BRANCH // plug-ready: a branch warehouse (a permanent lease — never freezes)
+  ATTENDANT // plug-ready: stock allocated to one attendant
+}
+
+model Location {
+  id        String       @id @default(uuid())
+  name      String
+  code      String       @unique // "MAIN", "WAREHOUSE-1"
+  type      LocationType @default(POS)
+  isDefault Boolean      @default(false) // exactly one true; enforced by a partial unique index
+  isActive  Boolean      @default(true)
+
+  // Whether this location may sell while disconnected. MAIN and ECOMMERCE are
+  // never offline-capable (CHECK in migration 0013): MAIN is the authoritative
+  // pool and a storefront is server-side by definition.
+  isOfflineCapable Boolean @default(false)
+
+  // LEASE / SESSION POLICY, set by the admin PER LOCATION.
+  //
+  // leaseWindowMinutes: NULL means FOREVER — this location's allocation never
+  // freezes (a permanent branch warehouse). A positive integer is the window in
+  // minutes. It may only be set on an offline-capable location (CHECK in 0013):
+  // a lease bounds how long an OFFLINE device may hold stock without syncing, so
+  // it is meaningless on a location that is always online. The service applies
+  // the 8-hour (480) default when an offline-capable location is created without
+  // one; passing null explicitly is how an admin chooses "forever".
+  leaseWindowMinutes Int?
+
+  // Optional daily selling window, "HH:MM" 24-hour. Both set or both NULL — a
+  // half-open window has no meaning (CHECK in 0013).
+  sessionStart String?
+  sessionEnd   String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  movements          StockMovement[]
+  stock              ProductLocationStock[]
+  allocationRequests AllocationRequest[]
+  // Sales rung up FROM this location (Task 3.2-LOC). Back-relation only.
+  sales              Sale[]                 @relation("SaleSellingLocation")
+  // Offline devices serving this location, and its freeze history (Task OFF.1).
+  devices            PosDevice[]
+  freezes            StockFreeze[]
+  // Goods received INTO this location (Task 5.1). Back-relation only.
+  goodsReceipts      GoodsReceipt[]
+
+  @@index([type])
+  @@map("locations")
+}
+
+// ---------------------------------------------------------------------------
+// OFFLINE DEVICES & CUSTODY (Task OFF.1). This is where the lease policy that
+// Task 10.2 STORED starts being ENFORCED, because a device is the thing that
+// TAKES CUSTODY — the fact 10.2 had no honest way to represent.
+//
+// A device binds to exactly ONE offline-capable location and sells only the
+// stock that location OWNS. Registering one against a location that cannot go
+// offline (MAIN, ECOMMERCE, or any location with isOfflineCapable = false) is
+// refused by the service AND by a trigger in migration 0015.
+//
+// THE LEASE CLOCK: startLease stamps leaseStartedAt = now and derives
+// leaseExpiresAt = now + location.leaseWindowMinutes. A NULL window means
+// FOREVER, which yields a NULL leaseExpiresAt — and a NULL expiry NEVER expires,
+// exactly as the engineering ledger requires of a permanent branch warehouse.
+// ---------------------------------------------------------------------------
+
+enum DeviceStatus {
+  ACTIVE // may take custody and sync
+  SUSPENDED // temporarily barred; existing captured sales may still be synced
+  RETIRED // permanently out of service
+}
+
+model PosDevice {
+  id         String   @id @default(uuid())
+  deviceName String
+  // The offline-capable location this device serves. Its stock IS the device's
+  // allocation; the device never sells anything else.
+  locationId String
+  location   Location @relation(fields: [locationId], references: [id])
+
+  status DeviceStatus @default(ACTIVE)
+
+  // CUSTODY. leaseStartedAt is when this device last took custody of its
+  // location's allocation. leaseExpiresAt is leaseStartedAt +
+  // location.leaseWindowMinutes, or NULL when the window is NULL (FOREVER —
+  // never freezes). Both NULL means the device holds no custody right now.
+  leaseStartedAt DateTime? @db.Timestamptz(3)
+  leaseExpiresAt DateTime? @db.Timestamptz(3)
+
+  // When a sync batch from this device last arrived. Used by the period-close
+  // guard: a device that has synced past a period's end can no longer deliver
+  // sales dated inside it.
+  lastSyncAt DateTime? @db.Timestamptz(3)
+
+  registeredBy String // platform user id
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @db.Timestamptz(3)
+
+  sales         Sale[]
+  capturedSales CapturedSale[]
+  freezes       StockFreeze[]
+
+  @@index([locationId, status])
+  @@map("pos_devices")
+}
+
+// ---------------------------------------------------------------------------
+// CAPTURED SALES — the sync ingest ledger (Task OFF.1).
+//
+// ONE ROW PER CAPTURED SALE, written by src/services/offline/sync.ts in the SAME
+// transaction that posts the sale. It is the reason a synced sale can never be
+// dropped: a capture either became a Sale (POSTED, saleId set) or is sitting in
+// the owner's NEEDS_RESOLUTION queue with the reason and the exact payload that
+// was attempted. There is no third outcome and no silent discard.
+//
+// WHY A SEPARATE TABLE rather than only a status on Sale: a capture that could
+// NOT become a Sale has no Sale row to carry its idempotencyKey. Recording the
+// key here is what stops a device's retry from re-queueing the same capture
+// forever, and it keeps the attempted payload for the owner to look at.
+// Sale.idempotencyKey ALSO exists and is unique — that index is the structural
+// guarantee against double-posting even if this bookkeeping were wrong.
+//
+// REPLAYED IS AN OUTCOME, NEVER A STORED STATE. It is what an ingest call
+// returns when the key is already POSTED here; a CHECK in migration 0015 makes
+// storing it impossible. A NEEDS_RESOLUTION row, by contrast, has posted nothing
+// and has no ledger effect, so a later retry of the same key is allowed to try
+// again — which is how the queue clears itself once the blocking condition (a
+// freeze, a closed shift) is gone.
+// ---------------------------------------------------------------------------
+
+enum CapturedSaleStatus {
+  POSTED // became a real Sale through the atomic sale transaction
+  REPLAYED // OUTCOME ONLY: this key was already posted; the call was a no-op
+  NEEDS_RESOLUTION // could not post; queued for the owner, nothing posted
+}
+
+model CapturedSale {
+  id String @id @default(uuid())
+
+  // The device's own key for this sale. Unique, so at-least-once delivery is
+  // safe: a replay is a no-op rather than a second posting.
+  idempotencyKey String @unique
+
+  deviceId String
+  device   PosDevice @relation(fields: [deviceId], references: [id])
+
+  /** When the sale ACTUALLY happened at the till. The journal entry dates to this. */
+  businessTimestamp DateTime @db.Timestamptz(3)
+
+  /** The exact captured payload as received, for audit and for a retry. */
+  payload String
+
+  status CapturedSaleStatus
+  /** Why it could not post. NULL when POSTED (CHECK-enforced in 0015). */
+  reason String?
+
+  /** The server Sale this capture became. NULL unless POSTED (CHECK-enforced). */
+  saleId String? @unique
+  sale   Sale?   @relation(fields: [saleId], references: [id])
+
+  /** Who was authenticated when the batch arrived — the sync actor, not the cashier. */
+  syncedBy   String
+  receivedAt DateTime  @default(now()) @db.Timestamptz(3)
+  resolvedAt DateTime? @db.Timestamptz(3)
+
+  @@index([status])
+  @@index([deviceId, status])
+  @@map("captured_sales")
+}
+
+// ---------------------------------------------------------------------------
+// FROZEN ALLOCATION (Task OFF.1) — one row per FREEZE EVENT.
+//
+// A lease expired without the device syncing, so the location's remaining owned
+// stock was immobilised: removed from its sellable allocation and NOT returned
+// to MAIN's sellable pool, because the server does not know what the offline
+// device sold and auto-returning could oversell. The freeze posts NO JOURNAL
+// ENTRY — no value left the entity, the goods are simply immobilised.
+//
+// The per-product detail of a LIVE freeze is ProductLocationStock.frozenQuantity.
+// Once resolved, the detail lives where it always lives: the immutable
+// stock_movements history (SALE + TRANSFER rows for a sync release, WRITE_OFF
+// rows for a write-off). This header records that a freeze happened, over what
+// lease, and how it ended.
+//
+// Exactly ONE active (PENDING_RECONCILIATION) freeze per location — a partial
+// unique index in 0015 — because stock is location-owned and a second
+// simultaneous freeze over the same slices would be ambiguous.
+// ---------------------------------------------------------------------------
+
+enum FreezeStatus {
+  PENDING_RECONCILIATION // live: immobilised, awaiting sync or a write-off decision
+  RELEASED_BY_SYNC // the device synced; real sales posted, the remainder went back to MAIN
+  WRITTEN_OFF // an admin wrote the stock off (Dr 5300 / Cr 1200) — a lost or stolen device
+}
+
+model StockFreeze {
+  id String @id @default(uuid())
+
+  deviceId String
+  device   PosDevice @relation(fields: [deviceId], references: [id])
+
+  locationId String
+  location   Location @relation(fields: [locationId], references: [id])
+
+  status FreezeStatus @default(PENDING_RECONCILIATION)
+
+  /** The lease expiry that triggered this freeze. */
+  leaseExpiredAt DateTime @db.Timestamptz(3)
+  frozenAt       DateTime @default(now()) @db.Timestamptz(3)
+
+  /** How many product slices were immobilised when the freeze was taken. */
+  productCount Int
+
+  /** Set on resolution. resolvedBy is NULL for a sync release — nobody decided it. */
+  resolvedAt     DateTime? @db.Timestamptz(3)
+  resolvedBy     String?
+  resolutionNote String?
+
+  @@index([status])
+  @@index([deviceId, status])
+  @@map("stock_freezes")
+}
+
+// ---------------------------------------------------------------------------
+// ALLOCATION REQUESTS (Task 10.2) — the attendant-request / admin-approve
+// workflow that sits ON TOP OF the value-neutral transfer engine.
+//
+// A request MOVES NO STOCK. It is a proposal: "this location would like N more
+// of this product." Nothing changes in product_location_stock, stock_movements,
+// Product.stockCount/stockValue or the ledger until an admin APPROVES it, and
+// the approval's stock effect is performed by src/services/inventory.ts's
+// transfer path in the SAME transaction that flips the status. So this table is
+// workflow state, never a second way to move stock.
+//
+// src/services/allocation.ts is the SOLE writer of this table, and it writes no
+// stock table at all.
+// ---------------------------------------------------------------------------
+
+enum AllocationRequestStatus {
+  PENDING
+  APPROVED
+  DECLINED
+  CANCELLED
+}
+
+model AllocationRequest {
+  id        String  @id @default(uuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+
+  // The location asking for stock.
+  locationId String
+  location   Location @relation(fields: [locationId], references: [id])
+
+  requestedQty Decimal  @db.Decimal(14, 3)
+  // What the admin actually granted. NULL until approved; an admin may edit the
+  // figure down (or up) at the moment of approval.
+  approvedQty  Decimal? @db.Decimal(14, 3)
+
+  status AllocationRequestStatus @default(PENDING)
+
+  requestedBy String // platform user id
+  decidedBy   String? // platform user id of the approver/decliner
+  decidedAt   DateTime? @db.Timestamptz(3)
+
+  // Audit link to the TRANSFER_IN stock movement that delivered the approved
+  // quantity into this location. Set only on APPROVED (CHECK in 0013), and a
+  // real FK — stock_movements are immutable and never deleted, so the link can
+  // never dangle.
+  transferId String?
+  transfer   StockMovement? @relation(fields: [transferId], references: [id])
+
+  note String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([status])
+  @@index([locationId, status])
+  @@map("allocation_requests")
+}
+
+// ---------------------------------------------------------------------------
+// PER-LOCATION OWNED STOCK (Module 10, Task 10.1). This is the table that makes
+// "every location owns its stock exclusively" real: a location can only sell
+// what it owns, so two channels (a till, a storefront, an offline device) can
+// never sell the same unit. See the engineering ledger "Stock Is Location-Owned".
+//
+// TWO-PART DESIGN, deliberately:
+//   * `stock_movements` is the IMMUTABLE HISTORY — every change, forever, never
+//     updated or deleted (its triggers enforce that).
+//   * `product_location_stock` is the CURRENT-BALANCE PROJECTION — a running
+//     total that is MEANT to change as stock moves, so it carries no
+//     immutability trigger. It is derivable from the history; it exists so a
+//     till can answer "what do I own?" without replaying every movement.
+//
+// INVARIANT: Product.stockCount (the tenant-wide aggregate) always equals
+// SUM(ProductLocationStock.quantity) for that product. The inventory service
+// maintains both sides inside one transaction. This is deliberately NOT
+// enforced by a cross-row aggregate trigger: such a trigger would have to
+// re-aggregate every location on every movement, and the service is the sole
+// writer. The DB enforces what it enforces cheaply and locally — quantity >= 0
+// — and the invariant is verified by acceptance criteria instead.
+//
+// VALUATION: per-location value is DERIVED from the product's tenant-wide
+// avgCost (quantity * avgCost). Weighted-average cost stays a single
+// tenant-wide figure in MVP — per-location cost layers are NOT introduced here.
+// Recorded as a decision: per-location costing would make the same physical unit
+// worth different amounts in different locations and would fork the WAC that
+// account 1200 reconciles against.
+// ---------------------------------------------------------------------------
+model ProductLocationStock {
+  id         String   @id @default(uuid())
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id])
+  locationId String
+  location   Location @relation(fields: [locationId], references: [id])
+
+  // Owned quantity of this product AT this location. A quantity, not money —
+  // Decimal(14,3), the same as every other stock quantity in the system.
+  // Never negative (CHECK constraint in migration 0011).
+  quantity Decimal @default(0) @db.Decimal(14, 3)
+
+  // THE IMMOBILISED PORTION of what this location owns (Task OFF.1, migration
+  // 0015). PENDING_RECONCILIATION in the sense of the engineering ledger "Lease & Freeze
+  // Safety": a lease expired without the device syncing, so the server does not
+  // know what was sold and refuses to guess.
+  //
+  // `quantity` KEEPS ITS EXACT MEANING — the total this location owns — so the
+  // invariant Product.stockCount == SUM(ProductLocationStock.quantity) is
+  // UNCHANGED by freezing. Frozen stock is still the tenant's stock, still
+  // carried in Product.stockValue and still in GL 1200; it has simply stopped
+  // being sellable. That is why a freeze posts NO journal entry.
+  //
+  //     SELLABLE = quantity - frozenQuantity
+  //
+  // Every outbound movement and every transfer SOURCE check is against SELLABLE
+  // (src/services/inventory.ts), so a frozen till cannot sell and an admin
+  // cannot transfer the stock away from under an unresolved freeze. CHECKs in
+  // 0015 pin 0 <= frozenQuantity <= quantity. Only the inventory service writes
+  // this column, exactly as with `quantity`.
+  frozenQuantity Decimal @default(0) @db.Decimal(14, 3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@unique([productId, locationId])
+  @@index([locationId])
+  @@map("product_location_stock")
+}
+
+// ---------------------------------------------------------------------------
+// Point of Sale (Module 3, Task 3.2). A sale decrements stock (via the
+// inventory service), posts its COGS side per line (via the ledger) and its
+// revenue side once (via the ledger), all in ONE transaction. src/services/
+// sales.ts writes only sale/shift tables; it never writes journal or stock
+// tables directly. M-Pesa here is a recorded tender with a reference + status;
+// the live Daraja callback is Task 3.3. eTIMS is Task 4.x.
+// ---------------------------------------------------------------------------
+
+enum ShiftStatus {
+  OPEN
+  CLOSED
+}
+
+enum SaleStatus {
+  COMPLETED
+  VOIDED
+}
+
+enum TenderType {
+  CASH
+  MPESA
+  BANK_TRANSFER
+  CREDIT // store account: increases the customer's receivable, no cash in
+}
+
+enum PaymentStatus {
+  PENDING // MPESA tenders start here until 3.3's callback confirms
+  CONFIRMED // CASH is CONFIRMED immediately
+  FAILED
+}
+
+// Settlement lifecycle of a sale's payment. Default FULLY_SETTLED (an all-cash
+// or all-confirmed sale, and the optimistic state while an M-Pesa STK is still
+// in clearing). Downgraded when an M-Pesa tender's callback fails/times out and
+// leaves the sale underpaid (Task 3.3). This is a MUTABLE lifecycle flag, not a
+// financial figure — the sale's amounts stay immutable.
+enum SalePaymentStatus {
+  FULLY_SETTLED
+  PARTIALLY_SETTLED
+  UNSETTLED
+}
+
+// Status of an M-Pesa STK Push transaction (Task 3.3). INITIATED until a
+// callback (or a timeout sweep) moves it to a terminal state. Terminal states
+// are final; a second callback for the same checkoutRequestId is a no-op.
+enum MpesaTxnStatus {
+  INITIATED
+  CALLBACK_OK
+  CALLBACK_FAILED
+  TIMED_OUT
+}
+
+model Shift {
+  id           String      @id @default(uuid())
+  cashierId    String // platform user id
+  openingFloat BigInt // KES cents
+  closingFloat BigInt? // counted cash at close
+  expectedCash BigInt? // openingFloat + cash sales - cash refunds
+  variance     BigInt? // closingFloat - expectedCash (signed)
+  status       ShiftStatus @default(OPEN)
+  openedAt     DateTime    @default(now()) @db.Timestamptz(3)
+  closedAt     DateTime? @db.Timestamptz(3)
+
+  sales Sale[]
+
+  @@index([cashierId, status])
+  @@map("shifts")
+}
+
+model Sale {
+  id         String     @id @default(uuid())
+  saleNumber String     @unique // SALE-YYYYMMDD-000001
+  shiftId    String
+  shift      Shift      @relation(fields: [shiftId], references: [id])
+  customerId String?
+  customer   Customer?  @relation(fields: [customerId], references: [id])
+  status     SaleStatus @default(COMPLETED)
+  subtotal   BigInt // sum of line nets, cents
+  vatTotal   BigInt // cents
+  total      BigInt // subtotal + vatTotal, cents
+  cogsTotal  BigInt // cents, for margin reporting
+
+  saleJournalEntryId String? @unique // revenue-side GL entry
+  voidedByEntryId    String? @unique
+  voidReason         String?
+  reference          String?
+  createdBy          String
+  createdAt          DateTime @default(now()) @db.Timestamptz(3)
+
+  // Payment settlement lifecycle (Task 3.3). Mutable — the sale immutability
+  // trigger permits this transition alongside the void transition, but never a
+  // change to any financial field.
+  paymentStatus SalePaymentStatus @default(FULLY_SETTLED)
+
+  /// How much of this sale's CREDIT receivable has been received, in KES cents
+  /// (Task 6). The ONLY new mutable fact accounts receivable needs on a sale.
+  ///
+  /// THERE IS DELIBERATELY NO `arOriginal` COLUMN. The receivable itself is DERIVED
+  /// as `SUM(this sale's CREDIT SaleTender amounts)`, and sale tenders are
+  /// WRITE-ONCE (0006 refuses UPDATE and DELETE on them), so the derivation can
+  /// never go stale. A stored copy could drift from the tenders it claims to total;
+  /// a derived figure cannot. Outstanding is therefore
+  /// `SUM(credit tenders) - arReceived`.
+  ///
+  /// It only ever RISES — a posted customer receipt is settled cash — and the sale
+  /// guard enforces that, the same way it is enforced for `PurchaseOrderLine
+  /// .receivedQty` (0017) and `SupplierBill.amountPaid` (0018). A deferred
+  /// constraint additionally pins it to the sum of the allocations behind it and
+  /// caps it at the credit receivable, so over-receipt is unrepresentable.
+  ///
+  /// A SALE WITH `arReceived > 0` CANNOT BE VOIDED (guard-enforced). Voiding it
+  /// would reverse the original `Dr 1100` and drop `creditBalance` by the full
+  /// credit amount while the receipt's `Cr 1100` stayed behind, leaving an ASSET
+  /// account carrying a credit balance that nothing explains.
+  arReceived BigInt @default(0)
+
+  /// THE TURNOVER TAX ACCRUED ON THIS SALE, in cents (Task 3B.2). Non-zero only for a
+  /// TURNOVER_TAX tenant: rate × subtotal, rounded once, posted Dr 6110 / Cr 2110 inside
+  /// the sale's own revenue entry. STORED, so the void reverses exactly what was posted
+  /// even if the rate later changes — the same snapshot discipline as SaleLine.lineCogs.
+  /// Set at insert; frozen by the sale guard thereafter. A sale never carries both TOT
+  /// and VAT (CHECK): TOT is the tax a business pays INSTEAD of VAT. NOT charged to the
+  /// customer and never on the receipt.
+  totAccrued BigInt @default(0)
+
+  // WHICH LOCATION SOLD IT (Task 3.2-LOC). A sale draws stock from the selling
+  // location's OWNED quantity — a till may only sell what it owns — and this
+  // records which one, so a VOID returns the stock to the same place it came
+  // from rather than depositing it in MAIN.
+  //
+  // NULL MEANS MAIN, per the NULL-means-default rule (as locationId NULL means
+  // MAIN on stock_movements). Every sale recorded before this column existed
+  // genuinely drew from MAIN — the sale path passed no location and the
+  // inventory service defaulted to it — so NULL states the truth about those
+  // rows and their voids keep returning to MAIN correctly. Nothing is
+  // backfilled; the definition of NULL carries the history.
+  //
+  // Sale-level, not line-level: a till sells from its own floor, so one selling
+  // location per sale is the real shape. Per-line locations would be a different
+  // feature and are deliberately not introduced.
+  sellingLocationId String?
+  sellingLocation   Location? @relation("SaleSellingLocation", fields: [sellingLocationId], references: [id])
+
+  // ---- OFFLINE DIMENSIONS (Task OFF.1, migration 0015) -------------------
+  //
+  // An offline sale is CAPTURED on a device and POSTED on the server through
+  // this very same atomic sale transaction — there is no second posting path.
+  // These columns record that provenance.
+  //
+  // Following NULL-means-default: every sale recorded before this migration was
+  // rung online, at the server, so `origin` defaults to ONLINE and the four
+  // provenance columns are NULL on them. Nothing is backfilled; the default and
+  // the NULLs state the truth about those rows. A CHECK in 0015 pins the two
+  // shapes: an ONLINE sale carries NO offline dimension at all, and an
+  // OFFLINE_SYNCED sale carries all four.
+  //
+  // All six are frozen by the sale immutability guard, with NO permitted
+  // transition: sync writes them in the SAME transaction that creates the sale,
+  // so there is no arrival-then-update step to allow.
+  origin SaleOrigin @default(ONLINE)
+
+  /** When the sale ACTUALLY happened at the till. The journal entry dates to THIS. */
+  businessTimestamp DateTime? @db.Timestamptz(3)
+  /** When the captured sale arrived at the server. Never conflated with the above. */
+  syncedAt          DateTime? @db.Timestamptz(3)
+  deviceId          String?
+  device            PosDevice? @relation(fields: [deviceId], references: [id])
+  /** The device's key for this capture. Replaying it is a no-op. NULL for an online sale. */
+  idempotencyKey    String?    @unique
+
+  /**
+   * Set ONLY on the CLOSED-PERIOD FALLBACK. When a capture's businessTimestamp
+   * falls in an already-closed period (the device stayed dark past the
+   * period-close guard), the entry posts into the CURRENT OPEN period instead of
+   * being dropped, and the true business date is recorded here so the
+   * redirection is auditable. `originalBusinessDate IS NOT NULL` therefore MEANS
+   * "this one was redirected" — that flag is the column's purpose, which is why
+   * it is not redundant with businessTimestamp.
+   */
+  originalBusinessDate DateTime? @db.Date
+
+  // ---- KRA eTIMS FISCAL STATUS (Module 9, Task 4.1) ---------------------
+  //
+  // eTIMS IS OPT-IN PER SALE AND IS THE MINORITY CASE. Most MSME sales are
+  // informal, carry no buyer PIN, and are never signed — and a sale is VALIDLY
+  // FINALIZED WITHOUT eTIMS. So the default is NOT_REQUESTED, and it stays
+  // NOT_REQUESTED unless a cashier asks for a KRA invoice.
+  //
+  // NULL MEANS NOT_REQUESTED, per the NULL-means-default rule: every sale
+  // recorded before this column existed was finalized without a fiscal invoice,
+  // which is exactly what NOT_REQUESTED says about it. Nothing is backfilled.
+  //
+  // This field is the ONLY thing eTIMS may change on a sale. Signing is
+  // POST-COMMIT: it runs against an already-committed sale and can never alter
+  // its stock, its ledger entries or its totals, and it posts NOTHING to the
+  // ledger — the VAT was already posted at sale time, and a fiscal attestation
+  // is not a financial event. The sale immutability guard (migration 0016)
+  // permits exactly the transitions below and freezes everything else:
+  //
+  //   NOT_REQUESTED -> PENDING_ETIMS | SIGNED | FAILED
+  //   PENDING_ETIMS -> SIGNED | FAILED
+  //   FAILED        -> PENDING_ETIMS | SIGNED      (operator fixed and resubmitted)
+  //   SIGNED        -> TERMINAL. A signed sale can never be un-signed.
+  fiscalStatus SaleFiscalStatus @default(NOT_REQUESTED)
+
+  lines         SaleLine[]
+  tenders       SaleTender[]
+  arAllocations CustomerReceiptAllocation[]
+  capturedSale  CapturedSale?
+  etimsInvoices EtimsInvoice[]
+
+  @@index([createdAt])
+  @@index([shiftId])
+  @@index([origin, businessTimestamp])
+  @@map("sales")
+}
+
+/**
+ * Whether a sale carries a KRA fiscal invoice (Module 9, Task 4.1).
+ *
+ * NOT_REQUESTED is the DEFAULT and the COMMON case — an informal sale with no
+ * buyer PIN, validly finalized with no eTIMS involvement at all. The system never
+ * auto-submits every sale.
+ */
+enum SaleFiscalStatus {
+  NOT_REQUESTED // no KRA invoice was asked for. The default, and most sales.
+  PENDING_ETIMS // requested, not yet signed (queued on a connectivity failure)
+  SIGNED // KRA signed it; the artifacts live on the EtimsInvoice row
+  FAILED // KRA REJECTED it, or retries were exhausted. Needs an operator.
+}
+
+/** Where a sale came from. Existing sales are ONLINE by definition (Task OFF.1). */
+enum SaleOrigin {
+  ONLINE // rung at the server, in real time
+  OFFLINE_SYNCED // captured on a device and replayed through the same atomic transaction
+}
+
+model SaleLine {
+  id         String  @id @default(uuid())
+  saleId     String
+  sale       Sale    @relation(fields: [saleId], references: [id])
+  lineNumber Int
+  productId  String
+  product    Product @relation(fields: [productId], references: [id])
+  quantity   Decimal @db.Decimal(14, 3)
+  unitPrice  BigInt // cents, price at time of sale (snapshot)
+  discount   BigInt  @default(0) // cents, per-line
+  vatRate    Decimal @db.Decimal(5, 2) // the rate APPLIED to this line (Task 3B.1: from tax class + regime + schedule; "0.00" unless code B)
+  lineNet    BigInt // (unitPrice*qty - discount), cents, ex-VAT
+  lineVat    BigInt // cents
+  lineTotal  BigInt // lineNet + lineVat
+  unitCogs   BigInt // cents, effective per-unit cost of this line at sale time (display)
+
+  // The EXACT cost posted to the ledger for this line — the single valuation
+  // event, snapshotted so a void reverses the same figure it originally posted
+  // rather than re-extending a rounded unit cost (Task 3.1-FIX). NULL means a
+  // pre-3.1-FIX row, whose posted cost was exactly roundHalfUp(quantity *
+  // unitCogs) because that is how the old model valued an outbound movement;
+  // per the NULL-means-default rule those rows are read, never backfilled.
+  lineCogs   BigInt?
+
+  /// The product's tax CLASS as it stood at sale time, and the KRA tax-type code the
+  /// line was charged under (Task 3B.1). Both NULL on a pre-3B.1 line, and per the
+  /// NULL-means-default rule that means STANDARD_RATED / code B: every product was
+  /// 16% standard-rated before this task (verified on both tenants), so the receipt,
+  /// the VAT return and an eTIMS invoice read such a line exactly as it was charged.
+  /// The code is the ONE mapping `kraTaxCode` produced — what the receipt prints and
+  /// what KRA is sent — so the two can never disagree. CHECK-pinned in 0024.
+  taxClass   TaxClass?
+  taxCode    KraTaxCode?
+
+  @@unique([saleId, lineNumber])
+  @@index([productId])
+  @@map("sale_lines")
+}
+
+model SaleTender {
+  id             String        @id @default(uuid())
+  saleId         String
+  sale           Sale          @relation(fields: [saleId], references: [id])
+  tenderType     TenderType
+  amount         BigInt // cents
+  status         PaymentStatus @default(CONFIRMED)
+  mpesaReference String? // seam for Task 3.3
+  // Links a tender to the STK Push transaction that settles it (Task 3.3).
+  mpesaTransactionId String? @unique
+  createdAt      DateTime      @default(now()) @db.Timestamptz(3)
+
+  @@index([saleId])
+  @@map("sale_tenders")
+}
+
+// ---------------------------------------------------------------------------
+// M-Pesa STK Push transactions (Task 3.3). One row per STK Push. Written ONLY
+// by src/services/mpesa/payment.ts, which also flips the linked SaleTender's
+// status and asks the ledger to move the amount out of 1015 M-Pesa Clearing on
+// confirmation (-> 1010) or reverse it on failure/timeout. Terminal states are
+// final; a replayed callback for the same checkoutRequestId is a no-op.
+// ---------------------------------------------------------------------------
+
+model MpesaTransaction {
+  id                String  @id @default(uuid())
+  saleId            String?
+  tenderId          String? @unique // the SaleTender this settles
+
+  // Request side (what we sent to Daraja / the simulator)
+  merchantRequestId String?
+  checkoutRequestId String  @unique // Daraja's STK correlation id
+  phoneNumber       String
+  amount            BigInt // KES cents
+  accountReference  String
+
+  // Response / callback side
+  status             MpesaTxnStatus @default(INITIATED)
+  resultCode         Int? // Daraja ResultCode (0 = success)
+  resultDesc         String?
+  mpesaReceiptNumber String?        @unique // e.g. "QK12ABC3XYZ"
+  callbackRawJson    String? // exact payload, for audit
+
+  confirmationEntryId String? @unique // GL entry moving 1015 -> 1010
+  reversalEntryId     String? @unique // GL entry clearing 1015 on fail
+
+  initiatedAt DateTime  @default(now()) @db.Timestamptz(3)
+  completedAt DateTime? @db.Timestamptz(3)
+
+  @@index([status])
+  @@index([saleId])
+  @@map("mpesa_transactions")
+}
+
+// ---------------------------------------------------------------------------
+// Per-tenant integration credentials (Task 3.4). Each tenant's external-provider
+// secrets live in THAT tenant's own schema, encrypted at rest with AES-256-GCM,
+// so cross-tenant leakage is structurally impossible rather than merely
+// prevented by a WHERE clause.
+//
+// OPTION A (money flow): a tenant's sales settle to the TENANT's own shortcode,
+// using the credentials stored here. Angaza's OWN credentials — the shortcode it
+// bills subscriptions to — live in public.platform_integration_credentials and
+// never mix with these.
+//
+// Written and read ONLY by src/services/credentials/credential-store.ts, which
+// is also the only module that decrypts a blob. The plaintext of a credential
+// never leaves that service except to the provider factory.
+//
+// PROVIDER-GENERIC BY DESIGN: adding eTIMS (4.1), Stripe or SMS is a new enum
+// value plus a blob shape in provider-schemas.ts — never a new table.
+// ENVIRONMENT-AWARE BY DESIGN: sandbox and production are separate rows, so
+// going live is activating the production row and flipping IntegrationSetting.
+// activeEnvironment — a config action, never a code change or a data migration.
+// ---------------------------------------------------------------------------
+
+enum IntegrationProvider {
+  MPESA
+  ETIMS
+  STRIPE
+  SMS
+}
+
+enum IntegrationEnvironment {
+  SANDBOX
+  PRODUCTION
+}
+
+enum CredentialStatus {
+  PENDING // stored, not yet activated
+  ACTIVE // the credential the provider factory constructs from
+  FAILED // a verification/test call against it failed
+  DISABLED // retired by the tenant
+}
+
+model TenantIntegrationCredential {
+  id          String                 @id @default(uuid())
+  provider    IntegrationProvider
+  environment IntegrationEnvironment
+
+  // The encrypted blob, split into its AES-256-GCM parts. NO plaintext secret
+  // is ever stored in any column of this table. keyRef names which key
+  // encrypted it — the seam that lets app-encrypted rows be migrated to Cloud
+  // KMS later by re-encryption alone, with no schema change.
+  ciphertext String
+  authTag    String
+  iv         String
+  keyRef     String
+
+  status CredentialStatus @default(PENDING)
+
+  label          String? // human note, e.g. "Till 174379"
+  lastVerifiedAt DateTime? @db.Timestamptz(3) // set when a test call/validation against the provider succeeds
+
+  createdBy String
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  // One credential set per provider+environment. A partial unique index in
+  // migration 0010 additionally guarantees at most ONE ACTIVE row per
+  // (provider, environment) — belt and suspenders, so that if this @@unique is
+  // ever relaxed to keep rotation history, ACTIVE integrity still holds.
+  @@unique([provider, environment])
+  @@index([provider, status])
+  @@map("tenant_integration_credentials")
+}
+
+// Which environment is live for a provider, and whether the integration is on
+// at all. Flipping activeEnvironment SANDBOX -> PRODUCTION is the "Go Live"
+// control; the credential store refuses to point it at an environment that has
+// no ACTIVE credential.
+model IntegrationSetting {
+  id                String                 @id @default(uuid())
+  provider          IntegrationProvider    @unique
+  activeEnvironment IntegrationEnvironment @default(SANDBOX)
+  enabled           Boolean                @default(false)
+  updatedAt         DateTime               @updatedAt @db.Timestamptz(3)
+
+  @@map("integration_settings")
+}
+
+model Customer {
+  id            String   @id @default(uuid())
+  name          String
+  phone         String?  @unique
+  email         String?
+  kraPin        String?
+  loyaltyPoints Int      @default(0)
+  creditLimit   BigInt   @default(0) // cents
+  creditBalance BigInt   @default(0) // cents, outstanding receivable
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @db.Timestamptz(3)
+
+  sales    Sale[]
+  receipts CustomerReceipt[]
+
+  @@index([name])
+  @@map("customers")
+}
+
+// ---------------------------------------------------------------------------
+// KRA eTIMS OSCU FISCAL SIGNING (Module 9, Task 4.1).
+//
+// ANGAZA IS NEVER THE KRA INTEGRATOR. Each tenant self-onboards on eTIMS under
+// THEIR OWN KRA PIN and supplies THEIR OWN OSCU credentials (tin, bhfId,
+// dvcSrlNo, and the cmcKey initialization returns) through /v1/integrations into
+// their own encrypted credential store. There is no Angaza-level eTIMS
+// credential, no shared signer and no fallback: a tenant without active,
+// initialized credentials simply cannot sign, and its sales still finalize
+// normally. Same Option A money/identity rule as M-Pesa — see the engineering ledger
+// "Per-Tenant Integration Credentials".
+//
+// eTIMS POSTS NOTHING TO THE LEDGER. The VAT was already posted at sale time by
+// the POS flow; a fiscal invoice is an ATTESTATION to KRA, not a financial
+// event. src/services/etims/etims-signing.ts writes these two tables and flips
+// Sale.fiscalStatus, and nothing else — no journal table, no stock table.
+// ---------------------------------------------------------------------------
+
+enum EtimsInvoiceStatus {
+  PENDING // allocated a number, not yet submitted
+  SIGNED // KRA signed it. TERMINAL and immutable (trigger in migration 0016).
+  REJECTED // KRA was REACHABLE and refused the payload. Never auto-retried:
+  //          the operator fixes the cause and resubmits deliberately.
+  QUEUED // KRA was UNREACHABLE. Retried later with the SAME invoice number —
+  //       reallocating one would double-file with KRA.
+  FAILED // retries exhausted. Terminal until an operator intervenes.
+}
+
+enum EtimsInvoiceType {
+  SALE
+  CREDIT_NOTE // the fiscal reversal of a SIGNED sale, issued from this same solution
+}
+
+// The tenant's OSCU device. DEVICE INITIALIZATION IS STATEFUL: KRA's
+// selectInitOsdcInfo(tin, bhfId, dvcSrlNo) returns a cmcKey (communication key)
+// that must accompany every later request. Init is occasional — setup, or key
+// expiry — never per sale.
+//
+// WHAT LIVES WHERE, deliberately: the cmcKey is a SECRET and lives ONLY in the
+// encrypted credential blob, never in a column here. This row holds the
+// NON-SECRET identity, the initialization state, and the invoice counter.
+model EtimsDevice {
+  id       String @id @default(uuid())
+  tin      String // the TENANT's own KRA PIN
+  bhfId    String // branch id, e.g. "00"
+  dvcSrlNo String // device serial number registered with KRA
+
+  initialized Boolean   @default(false)
+  lastInitAt  DateTime? @db.Timestamptz(3)
+
+  // The monotonic source of per-device invoice numbers. Allocated under
+  // SELECT ... FOR UPDATE, so two concurrent signs can never take the same one.
+  lastInvoiceNo Int @default(0)
+
+  createdBy String
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  invoices EtimsInvoice[]
+
+  @@unique([tin, bhfId, dvcSrlNo])
+  @@map("etims_devices")
+}
+
+// One fiscal invoice. A SIGNED row is a PERMANENT FISCAL RECORD: migration 0016
+// forbids editing its KRA artifacts or its number, and forbids deleting it at
+// all.
+model EtimsInvoice {
+  id     String @id @default(uuid())
+  saleId String
+  sale   Sale   @relation(fields: [saleId], references: [id])
+
+  invoiceType EtimsInvoiceType @default(SALE)
+
+  // For a CREDIT_NOTE: the SIGNED sale invoice it reverses. KRA requires a
+  // credit note to reference the original invoice, and it must come from the
+  // same solution that filed it.
+  originalInvoiceId String?
+  originalInvoice   EtimsInvoice?  @relation("EtimsCreditNote", fields: [originalInvoiceId], references: [id])
+  creditNotes       EtimsInvoice[] @relation("EtimsCreditNote")
+
+  // Which device filed it, and the device's sequential number. NUMBERS ARE
+  // SEQUENTIAL PER DEVICE (KRA's rule), so the uniqueness below is scoped to the
+  // device rather than to the tenant: a second branch device legitimately files
+  // its own invoice #1. With the single device an MSME actually has, the two are
+  // the same thing.
+  etimsDeviceId      String
+  device             EtimsDevice @relation(fields: [etimsDeviceId], references: [id])
+  etimsInvoiceNumber Int
+
+  status EtimsInvoiceStatus @default(PENDING)
+
+  // KRA's artifacts, present only once SIGNED. Frozen from that moment.
+  kraReceiptNumber String?
+  rcptSign         String?
+  intrlData        String?
+  sdcDateTime      String?
+  qrCodeUrl        String?
+
+  // Why KRA refused, when it did. resultCode is KRA's own code as a string —
+  // it is an opaque identifier, not an arithmetic quantity.
+  resultCode String?
+  resultMsg  String?
+
+  retryCount    Int       @default(0)
+  lastAttemptAt DateTime? @db.Timestamptz(3)
+
+  // The exact payload submitted and the exact response received, for audit.
+  // NEITHER EVER CONTAINS A SECRET: the signing service strips the cmcKey and
+  // the auth token before persisting, because a stored request is a stored
+  // credential if you are careless.
+  submittedPayload String?
+  rawResponse      String?
+
+  createdBy String
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@unique([etimsDeviceId, etimsInvoiceNumber])
+  // One SALE invoice per sale, but a sale may also carry credit notes, so the
+  // constraint is per (sale, type) rather than per sale. A partial unique index
+  // in migration 0016 pins "at most one SALE invoice per sale" exactly.
+  @@index([saleId])
+  @@index([status])
+  @@index([etimsInvoiceNumber])
+  @@map("etims_invoices")
+}
+
+// ---------------------------------------------------------------------------
+// BUSINESS PROFILE (Task 5.1) — the per-tenant business-configuration SINGLETON.
+//
+// EXACTLY ONE ROW PER TENANT SCHEMA, enforced structurally: the primary key is
+// pinned to the literal 'singleton' by a CHECK, so a second row is not merely
+// refused by a service, it is unrepresentable.
+//
+// WHY IT EXISTS: posting decisions depend on facts about the BUSINESS, not about
+// a transaction. Whether the tenant is VAT-registered decides whether a purchase
+// receipt capitalises the net cost and recovers input VAT, or capitalises the
+// VAT-inclusive cost with nothing recoverable (see the engineering ledger "Procurement &
+// GRNI"). Those facts belong in the tenant's own schema, next to the ledger that
+// consumes them.
+//
+// THIS IS THE HOME FOR STATUTORY FLAGS, and later tasks extend it rather than
+// scattering them: payroll's NSSF / SHA / housing-levy applicability and
+// effective-dated rate sets, and the reporting module's regime-dependent tax
+// reports, all belong here. Adding one is a column plus a CHECK, never a new
+// table.
+//
+// RELATIONSHIP TO public.tenants.taxRegime (recorded so the two are never
+// confused): the PLATFORM registry's taxRegime is REGISTRY METADATA — it
+// describes the tenant for routing, billing and cohort segmentation, and no code
+// reads it for accounting. THIS table is AUTHORITATIVE FOR POSTING. A posting
+// path must never read the platform field: it lives in another schema, it is not
+// transactionally coupled to the ledger it would be deciding for, and reaching
+// across for it would be exactly the cross-schema read the engineering ledger forbids.
+// ---------------------------------------------------------------------------
+
+enum TenantTaxRegime {
+  VAT_REGISTERED // charges and recovers VAT; receipts capitalise NET cost
+  TURNOVER_TAX // 3% turnover-tax regime; no VAT recovery, receipts capitalise GROSS
+  EXEMPT // neither; no VAT recovery, receipts capitalise GROSS
+}
+
+model BusinessProfile {
+  // Pinned to 'singleton' by a CHECK in migration 0017. The primary key plus that
+  // CHECK is the one-row guarantee.
+  id String @id @default("singleton")
+
+  taxRegime TenantTaxRegime @default(TURNOVER_TAX)
+
+  // DERIVED FROM taxRegime AND KEPT CONSISTENT WITH IT BY A CHECK:
+  // VAT_REGISTERED implies true, every other regime implies false. It is stored
+  // rather than computed because it is what the posting path actually branches
+  // on, and a stored boolean the database guarantees cannot contradict the regime
+  // is clearer at the point of use than a derivation repeated in every caller.
+  // The CHECK is what makes "cannot contradict" true.
+  isVatRegistered Boolean @default(false)
+
+  // The business's own KRA PIN as it appears on its invoices. Distinct from the
+  // eTIMS credential's `tin`: that is an integration secret in the encrypted
+  // store, this is public business identity printed on a receipt.
+  kraPin String?
+
+  // RECEIPT / DISPLAY IDENTITY (Task T-A13, migration 0029). What the business prints on
+  // its receipts. Display only: nothing posts from these. Branding (colour, logo URL)
+  // lives on the platform registry row (public.tenants) and is read alongside.
+  legalName         String?
+  addressLine       String?
+  phone             String?
+  email             String?
+  receiptFooter     String?
+  showLogoOnReceipt Boolean @default(true)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@map("business_profile")
+}
+
+// ---------------------------------------------------------------------------
+// PROCUREMENT — PURCHASE ORDERS AND GOODS RECEIPTS (Module 4, Task 5.1).
+//
+// THE RECEIVE SIDE ONLY. A goods receipt accrues what is owed to 2050 GRNI; the
+// supplier BILL that clears GRNI to Accounts Payable, recognises input VAT and
+// posts any purchase price variance is Task 5.2 and is deliberately absent. What
+// IS present is everything a bill will need to match against: the PO, its lines
+// with ordered and received quantities, and the GRN with its stock movements.
+//
+// src/services/procurement.ts is the SOLE writer of these three tables. It
+// writes NO stock table and posts NO journal entry itself: a receipt's stock and
+// GL effects go through src/services/inventory.ts's transaction-participating
+// mover, inside ONE transaction with the GRN, so there is no second stock path and
+// the WAC / location-ownership / aggregate invariants are reused rather than
+// reimplemented.
+// ---------------------------------------------------------------------------
+
+enum PurchaseOrderStatus {
+  DRAFT // freely editable; nothing committed in the eyes of the ledger
+  APPROVED // committed to the supplier; may now be received against
+  PARTIALLY_RECEIVED // some lines received, more outstanding
+  RECEIVED // every line fully received
+  CLOSED // terminal: finished with, whether or not fully received
+  CANCELLED // terminal: never happened
+}
+
+model PurchaseOrder {
+  id String @id @default(uuid())
+
+  // Sequential per tenant from a per-schema sequence — the same mechanism journal
+  // entry numbers use (migration 0003). Monotonic and unique; NOT gap-free,
+  // because a sequence is non-transactional and a rolled-back PO legitimately
+  // burns a number. A gap is a far smaller problem than two POs sharing a number.
+  poNumber Int @unique
+
+  supplierId String
+  supplier   Supplier @relation(fields: [supplierId], references: [id])
+
+  status PurchaseOrderStatus @default(DRAFT)
+
+  orderDate    DateTime @db.Date
+  expectedDate DateTime? @db.Date
+
+  // MULTI-CURRENCY PLUG (deferred). The column exists so enabling foreign currency
+  // later is new rows and a relaxed CHECK rather than an ALTER across live
+  // purchase history. A CHECK pins it to 'KES' today, because a column that
+  // silently accepted 'USD' while every downstream figure assumed shillings would
+  // be worse than no column at all.
+  currency String @default("KES")
+
+  // Sum of the lines' net amounts, in KES cents. BigInt, never a float.
+  //
+  // WHAT "NET" MEANS DEPENDS ON THE TENANT, and it is the same convention as
+  // PurchaseOrderLine.unitCost: VAT-EXCLUSIVE for a VAT-registered tenant,
+  // VAT-INCLUSIVE for a non-registered one, because an unrecoverable tax is part
+  // of what the goods cost. See the engineering ledger "Procurement & GRNI".
+  subtotal BigInt @default(0)
+
+  notes String?
+
+  createdById  String
+  approvedById String?
+  approvedAt   DateTime? @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  lines         PurchaseOrderLine[]
+  goodsReceipts GoodsReceipt[]
+  bills         SupplierBill[]
+
+  @@index([status])
+  @@index([supplierId, status])
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderLine {
+  id    String        @id @default(uuid())
+  poId  String
+  order PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Cascade)
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+
+  // Decimal(14,3), as every quantity in this system is. Positive (CHECK).
+  orderedQty Decimal @db.Decimal(14, 3)
+
+  /// The agreed cost per unit, in KES cents.
+  ///
+  /// ITS MEANING DEPENDS ON THE TENANT'S VAT STATUS, deliberately, and this is the
+  /// most important note on this model:
+  ///   VAT_REGISTERED tenant -> the NET (VAT-exclusive) cost. Input VAT is
+  ///                            recoverable, so it is not part of the asset's cost.
+  ///   non-registered tenant -> the VAT-INCLUSIVE cost. The tax is unrecoverable,
+  ///                            so it IS part of what the goods cost.
+  /// Inventory is therefore carried at net for a registered tenant and at the
+  /// inclusive figure for a non-registered one, and in BOTH cases this column is
+  /// exactly the amount that reaches account 1200. See the engineering ledger
+  /// "Procurement & GRNI".
+  unitCost BigInt
+
+  // orderedQty * unitCost, rounded ONCE through the single roundHalfUp primitive.
+  // Stored so a PO's committed value is a recorded fact rather than a figure each
+  // reader recomputes slightly differently.
+  lineNet BigInt
+
+  // How much has actually arrived. Moved only by a goods receipt, and CHECK-capped
+  // at orderedQty so an over-receipt is unrepresentable rather than merely refused
+  // by the service.
+  receivedQty Decimal @default(0) @db.Decimal(14, 3)
+
+  /// How much has been INVOICED by the supplier. Moved only by posting a supplier
+  /// bill (Task 5.2) and CHECK-capped at `receivedQty` — THE THREE-WAY MATCH, held
+  /// by the database: you cannot be invoiced for more than arrived, no matter which
+  /// code path asks. A supplier who invoices ahead of delivery is a dispute, not a
+  /// row this schema can represent.
+  ///
+  /// Unlike `receivedQty` it is NOT monotonic: cancelling an unpaid posted bill
+  /// reverses its entry and gives the quantity back, because the goods are once again
+  /// received-and-not-invoiced. See the engineering ledger "Accounts Payable".
+  billedQty Decimal @default(0) @db.Decimal(14, 3)
+
+  /// The cumulative NET amount the supplier has actually INVOICED against this
+  /// line, in KES cents — NOT the amount cleared from GRNI.
+  ///
+  /// The two are different on purpose and the difference IS the purchase price
+  /// variance: GRNI was accrued at `unitCost` (the agreed PO price), while this
+  /// column accumulates what the invoices said. The variance is posted to 5250, which
+  /// is why inventory keeps the cost it was received at instead of being restated.
+  ///
+  /// "Net" carries the same regime-dependent meaning as `unitCost` above.
+  billedNet BigInt @default(0)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  movements StockMovement[]
+  billLines SupplierBillLine[]
+
+  // One line per product per PO: two lines for the same product would make "how
+  // much of this have we received" ambiguous.
+  @@unique([poId, productId])
+  @@index([productId])
+  @@map("purchase_order_lines")
+}
+
+// A GOODS RECEIPT NOTE. An IMMUTABLE POSTED FACT: goods either arrived or they did
+// not, and migration 0017 refuses both UPDATE and DELETE on this table outright —
+// the same discipline as stock_movements (0005) and etims_invoices (0016).
+//
+// There is deliberately NO status column. A GRN is not a workflow; it is the record
+// that stock moved and value was accrued. REVERSAL IS DEFERRED: a mis-received GRN
+// is corrected through the supplier-credit path in Task 5.2, never by editing or
+// deleting history.
+//
+// poId is REQUIRED. This entity exists only for receipts against a purchase order;
+// an ad-hoc receipt (an invoice already in hand, no PO) creates no GRN and posts
+// straight to Accounts Payable, exactly as it did before this task.
+model GoodsReceipt {
+  id String @id @default(uuid())
+
+  // Sequential per tenant from a per-schema sequence, like poNumber.
+  grnNumber Int @unique
+
+  poId  String
+  order PurchaseOrder @relation(fields: [poId], references: [id])
+
+  // The location that TAKES OWNERSHIP of the goods. Defaults to the tenant's MAIN
+  // pool exactly as the sale path defaults its selling location, so stock arrives
+  // somewhere specific and the location-ownership rules apply from the moment it
+  // lands (the engineering ledger "Stock Is Location-Owned").
+  receivingLocationId String
+  receivingLocation   Location @relation(fields: [receivingLocationId], references: [id])
+
+  receivedById String
+  receivedAt   DateTime @db.Timestamptz(3)
+  notes        String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  movements StockMovement[]
+
+  @@index([poId])
+  @@index([receivedAt])
+  @@map("goods_receipts")
+}
+
+// ===========================================================================
+// ACCOUNTS PAYABLE — SUPPLIER BILLS, PAYMENTS AND ALLOCATION (Module 7, Task 5.2)
+//
+// This is the INVOICE side of procurement. Task 5.1 built the RECEIVE side: goods
+// arrive with a delivery note, stock rises, and what is owed accrues to 2050 GRNI
+// because a delivery note is not a tax invoice. These tables are what happens when
+// the supplier's actual invoice turns up:
+//
+//   * GRNI clears to 2000 Accounts Payable at the amount that was accrued;
+//   * the recoverable input VAT lands in 1400 — at INVOICE time, which is the only
+//     time it legally exists, because a VAT claim needs a tax invoice;
+//   * any difference between the PO price we accrued and the price we were actually
+//     invoiced goes to 5250 Purchase Price Variance, so INVENTORY KEEPS THE COST IT
+//     WAS RECEIVED AT rather than being silently restated after the fact.
+//
+// src/services/payables.ts is the ONLY module permitted to write any of the four
+// tables below. It writes NO stock table and never posts to account 1200 — a bill
+// is a change to what we OWE, not to what we HOLD.
+// ===========================================================================
+
+/// DRAFT is the only editable state and the only state with NO general-ledger
+/// effect: a keyed-in invoice that has not been checked against the delivery is
+/// data entry, not a liability. Posting it books the entry and moves it to
+/// AWAITING_PAYMENT, after which the figures are frozen.
+enum SupplierBillStatus {
+  DRAFT // keyed in, nothing posted, freely editable
+  AWAITING_PAYMENT // posted to the ledger; nothing paid yet
+  PARTIALLY_PAID // some payment allocated, a balance remains
+  PAID // terminal: amountPaid == total
+  CANCELLED // terminal: withdrawn before any payment was allocated
+}
+
+/// How a supplier was actually paid, which is what selects the credit account:
+/// CASH -> 1000 Cash on Hand, BANK -> 1020 Bank Account, MPESA -> 1010 M-Pesa Till.
+///
+/// MPESA IS A PLUG, NOT AN INTEGRATION. It records that a payment went out over
+/// M-Pesa; it initiates nothing. There is no B2B disbursement here — no Daraja
+/// call, no transaction-status polling, no callback. Wiring that up later is a new
+/// service against the existing per-tenant credential store plus rows in
+/// `mpesa_transactions`, NOT an ALTER across settled payment history. See
+/// the engineering ledger "Accounts Payable".
+enum SupplierPaymentMethod {
+  CASH
+  BANK
+  MPESA
+}
+
+/// A SUPPLIER'S INVOICE, as a document we have received and owe against.
+///
+/// `billNumber` is THE SUPPLIER'S OWN reference, not a number we allocate, and
+/// `@@unique([supplierId, billNumber])` is therefore the DUPLICATE-PAYMENT GUARD:
+/// the most common and most expensive accounts-payable error is paying the same
+/// invoice twice because it arrived twice (by email and on paper, or chased by a
+/// supplier who was already paid). The database refuses the second entry.
+///
+/// It is scoped per supplier rather than tenant-wide because invoice numbering
+/// belongs to the supplier: two different suppliers both issuing "INV-001" is
+/// ordinary, and a tenant-wide unique would block the second one for no reason.
+model SupplierBill {
+  id String @id @default(uuid())
+
+  /// The supplier's invoice reference exactly as printed on their document. Ours to
+  /// record, never ours to generate — which is why there is no sequence behind it.
+  billNumber String
+
+  supplierId String
+  supplier   Supplier @relation(fields: [supplierId], references: [id])
+
+  /// The purchase order this invoice is matched against, when there is one.
+  ///
+  /// NULLABLE because a bill need not have a PO: a standalone expense invoice
+  /// (rent, electricity, a repair) is a real payable with nothing ordered and
+  /// nothing received. A bill carrying any PO_MATCH line MUST have this set, and
+  /// every such line must belong to THIS order — enforced by trigger in migration
+  /// 0018, because clearing GRNI from an unrelated purchase order would move a
+  /// liability that this invoice has nothing to do with.
+  poId  String?
+  order PurchaseOrder? @relation(fields: [poId], references: [id], onDelete: Restrict)
+
+  billDate DateTime @db.Date
+
+  /// When it falls due. Supplied by the caller; otherwise derived from the
+  /// supplier's `paymentTerms` where those parse ("Net 30" -> billDate + 30 days),
+  /// and otherwise equal to `billDate` — due on receipt, which is the safe default
+  /// because it ages immediately and shows up rather than hiding in "current".
+  dueDate DateTime @db.Date
+
+  status SupplierBillStatus @default(DRAFT)
+
+  /// Sum of the lines' net amounts, in KES cents.
+  ///
+  /// "NET" IS REGIME-DEPENDENT, exactly as on PurchaseOrderLine.unitCost: for a
+  /// VAT-registered tenant it is the VAT-exclusive figure and `vatTotal` carries
+  /// the recoverable tax; for a non-registered tenant `vatTotal` is 0 and THIS
+  /// column carries the whole invoiced amount including any VAT charged, because
+  /// that tax is unrecoverable and is part of what the purchase cost. In both cases
+  /// `total` is what the supplier is owed.
+  subtotalNet BigInt
+
+  /// Recoverable input VAT, in KES cents. ALWAYS 0 for a non-VAT-registered tenant
+  /// — there is nothing to recover, so recognising an asset for it would overstate
+  /// both assets and the VAT position.
+  vatTotal BigInt
+
+  /// The gross invoice amount: `subtotalNet + vatTotal`, CHECK-enforced. This is
+  /// the figure credited to 2000 Accounts Payable and the figure a payment settles.
+  total BigInt
+
+  /// How much has been allocated to this bill by supplier payments. Moved only by
+  /// `src/services/payables.ts` and CHECK-capped at `total`, so an over-payment
+  /// against one invoice is unrepresentable rather than merely refused in code. It
+  /// only ever rises — a posted payment is a settled fact.
+  amountPaid BigInt @default(0)
+
+  /// MULTI-CURRENCY PLUG (deferred), identical to the one on PurchaseOrder: the
+  /// column exists so foreign-currency payables are later new rows and a relaxed
+  /// CHECK rather than an ALTER across settled invoice history. A CHECK pins it to
+  /// 'KES' today.
+  currency String @default("KES")
+
+  notes String?
+
+  createdById String
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  lines       SupplierBillLine[]
+  allocations SupplierPaymentAllocation[]
+
+  /// THE DUPLICATE-PAYMENT GUARD. See the model note above.
+  @@unique([supplierId, billNumber])
+  @@index([status])
+  @@index([supplierId, status])
+  @@index([dueDate])
+  @@map("supplier_bills")
+}
+
+/// ONE LINE OF A SUPPLIER'S INVOICE. DISCRIMINATED: exactly one of two kinds, and a
+/// CHECK in migration 0018 makes anything else unrepresentable.
+///
+///   PO_MATCH  (`purchaseOrderLineId` set) — stock we ordered and received. It
+///             CLEARS GRNI; it does NOT touch inventory, because the goods were
+///             already valued when they arrived.
+///   EXPENSE   (`expenseAccountCode` set) — a cost with nothing received against
+///             it. It debits that account directly.
+///
+/// The discriminator is a pair of nullable columns rather than a kind enum because
+/// the kind IS which reference is present: an enum would make a PO_MATCH line with
+/// no PO line, or an EXPENSE line with no account, expressible and then need a
+/// second constraint to forbid it.
+model SupplierBillLine {
+  id     String       @id @default(uuid())
+  billId String
+  bill   SupplierBill @relation(fields: [billId], references: [id], onDelete: Cascade)
+
+  /// What the supplier called it on the invoice. Free text on purpose: it is their
+  /// wording, and an audit wants to see what the document actually said.
+  description String
+
+  /// Decimal(14,3), as every quantity in this system is. Positive (CHECK).
+  quantity Decimal @db.Decimal(14, 3)
+
+  /// The VAT percentage the supplier charged on this line. A RATE as a Decimal,
+  /// NEVER money and never routed through the money parser. Per line rather than
+  /// per bill because a single invoice legitimately mixes standard-rate,
+  /// zero-rated and exempt items.
+  vatRate Decimal @db.Decimal(5, 2)
+
+  /// quantity x unit cost, rounded ONCE through roundHalfUp. Regime-dependent
+  /// meaning, as on the bill header.
+  lineNet BigInt
+
+  /// `applyRatePercent(lineNet, vatRate)` for a VAT-registered tenant; 0 otherwise.
+  lineVat BigInt
+
+  /// `lineNet + lineVat`, CHECK-enforced.
+  lineTotal BigInt
+
+  // --- PO_MATCH ------------------------------------------------------------
+
+  purchaseOrderLineId String?
+  purchaseOrderLine   PurchaseOrderLine? @relation(fields: [purchaseOrderLineId], references: [id], onDelete: Restrict)
+
+  /// The NET unit cost the supplier INVOICED, which is not necessarily the
+  /// `unitCost` the purchase order agreed and GRNI was accrued at. The gap between
+  /// the two is the purchase price variance. Set on a PO_MATCH line, NULL on an
+  /// EXPENSE line.
+  unitCostNet BigInt?
+
+  /// How much this line actually took OUT of 2050 GRNI, in KES cents — written when
+  /// the bill is POSTED, NULL until then and NULL forever on an EXPENSE line.
+  ///
+  /// IT IS STORED RATHER THAN DERIVED, and that is what makes GRNI reach EXACTLY
+  /// zero. GRNI was accrued receipt by receipt, each rounded once; a bill covering
+  /// several receipts in one line cannot reproduce that sum by re-rounding the
+  /// total. So a line that fully bills its PO line clears the ENTIRE REMAINING
+  /// ACCRUAL — the same residual discipline as the DEPLETING outbound rule in
+  /// inventory valuation — and the remainder can only be computed if what earlier
+  /// bills removed is recorded. The rounding residue lands in 5250, where a price
+  /// difference belongs.
+  grniCleared BigInt?
+
+  // --- EXPENSE -------------------------------------------------------------
+
+  /// The account to charge, as a 4-digit chart code. A REAL FOREIGN KEY to
+  /// `accounts.code`, so a typo cannot create a line pointing at an account that
+  /// does not exist. Migration 0018 adds two more layers: a CHECK forbidding the
+  /// codes this module must never reach (1200, 2000, 2050, 1400, 5250) and a
+  /// trigger restricting it to the EXPENSE, COST_OF_SALES and ASSET classes.
+  ///
+  /// 1200 is excluded because inventory moves ONLY through the inventory service
+  /// (the engineering ledger "Single-Writer Service Boundaries"); the others are excluded
+  /// because they are this posting's own control accounts, and charging one as an
+  /// expense would silently unbalance the very reconciliation it feeds.
+  expenseAccountCode String?
+  expenseAccount     Account? @relation(fields: [expenseAccountCode], references: [code], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([billId])
+  @@index([purchaseOrderLineId])
+  @@index([expenseAccountCode])
+  @@map("supplier_bill_lines")
+}
+
+/// MONEY ACTUALLY LEAVING THE BUSINESS to a supplier. An IMMUTABLE POSTED FACT:
+/// migration 0018 refuses UPDATE and DELETE outright, the same discipline as
+/// `stock_movements` (0005), `etims_invoices` (0016) and `goods_receipts` (0017).
+///
+/// A payment is RECORDED here; it is not INITIATED here. Even for MPESA this row is
+/// a record of a disbursement made elsewhere (see SupplierPaymentMethod).
+model SupplierPayment {
+  id String @id @default(uuid())
+
+  /// Sequential per tenant from a per-schema sequence, exactly like `poNumber` and
+  /// `grnNumber`: monotonic and unique, NOT gap-free, because a sequence is
+  /// non-transactional and a rolled-back payment legitimately burns a number. A
+  /// missing internal payment number has no regulatory meaning; two payments
+  /// sharing one would be a reconciliation defect.
+  paymentNumber Int @unique
+
+  supplierId String
+  supplier   Supplier @relation(fields: [supplierId], references: [id])
+
+  paymentDate DateTime @db.Date
+  method      SupplierPaymentMethod
+
+  /// The amount that left, in KES cents. Strictly positive (CHECK) — a negative
+  /// payment would be a supplier refund, which is a different document and is
+  /// deliberately out of scope.
+  amount BigInt
+
+  /// The external reference: an M-Pesa code, a cheque number, a bank transfer ref.
+  reference String?
+  notes     String?
+
+  createdById String
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+
+  allocations SupplierPaymentAllocation[]
+
+  @@index([supplierId])
+  @@index([paymentDate])
+  @@map("supplier_payments")
+}
+
+/// WHICH INVOICE A PAYMENT PAID. The link that turns "we sent the supplier 50,000"
+/// into "invoice 118 is settled and invoice 119 is half paid".
+///
+/// `SUM(allocations.amount) == payment.amount` ALWAYS — enforced by
+/// src/services/payables.ts inside the payment's own transaction. There is NO
+/// on-account / unallocated supplier balance in this build: every shilling paid is
+/// pointed at an invoice. A prepayment would be a supplier DEBIT balance, which is
+/// an asset with its own recognition and offset rules, and inventing one as "a
+/// payment with no allocations" would leave Accounts Payable carrying a credit
+/// nobody could explain. Deferring it is additive — a new nullable column or a
+/// prepayment row — not an ALTER across settled payments.
+model SupplierPaymentAllocation {
+  id String @id @default(uuid())
+
+  paymentId String
+  payment   SupplierPayment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  billId String
+  bill   SupplierBill @relation(fields: [billId], references: [id])
+
+  /// Strictly positive (CHECK). Capped by the bill's remaining balance in the
+  /// service, and backstopped by the bill's `amountPaid <= total` CHECK.
+  amount BigInt
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  /// One allocation per bill per payment: two rows for the same pair would make
+  /// "how much of this payment went to that invoice" ambiguous, and would let a
+  /// service bug double-apply without the database noticing.
+  @@unique([paymentId, billId])
+  @@index([billId])
+  @@map("supplier_payment_allocations")
+}
+
+// ===========================================================================
+// ACCOUNTS RECEIVABLE — CUSTOMER RECEIPTS AND ALLOCATION (Module 6, Task 6)
+//
+// THE MODEL, AND WHY IT IS SMALLER THAN PAYABLES: a credit sale ALREADY IS the
+// receivable document. At sale time `src/services/sales.ts` posted
+// `Dr 1100 Accounts Receivable / Cr revenue (+ Cr 2100 output VAT)` and raised
+// `Customer.creditBalance` by the CREDIT-tender portion. So there is no invoice
+// entity to create here, no GRNI to clear, no price variance and no VAT to
+// recognise — all of that happened at the till.
+//
+// What this adds is the money coming BACK: a receipt from a customer, allocated
+// against specific credit sales, posting `Dr cash|bank|M-Pesa / Cr 1100` and
+// reducing `creditBalance`.
+//
+// THE RECEIVABLE PER SALE IS DERIVED, NEVER STORED: it is
+// `SUM(its CREDIT SaleTender amounts)`, and sale tenders are WRITE-ONCE (migration
+// 0006 refuses UPDATE and DELETE on them). A stored copy could drift from the
+// tenders; a derived figure cannot. The only new MUTABLE fact is how much of it has
+// been received, which is `Sale.arReceived` below.
+//
+// `src/services/receivables.ts` is the ONLY module permitted to write the two
+// tables here. It writes NO stock table and posts to NO revenue or VAT account —
+// the sale already did that, and posting again would double-count the revenue.
+// ===========================================================================
+
+/// How a customer actually paid, which is what selects the debit account:
+/// CASH -> 1000 Cash on Hand, BANK -> 1020 Bank Account, MPESA -> 1010 M-Pesa Till.
+///
+/// MPESA IS A PLUG, NOT AN INTEGRATION — and it is the MIRROR of
+/// `SupplierPaymentMethod.MPESA` (Task 5.2). It records that a customer settled over
+/// M-Pesa; it initiates nothing. There is no STK PULL, no C2B registration and no
+/// callback here. The POS sale path's live STK PUSH (Task 3.3) is a different
+/// operation entirely: that collects at the till for a sale being rung up, whereas
+/// this records a customer paying down an account they already owe. Wiring a real
+/// pull later is a new service over the EXISTING per-tenant credential store, not an
+/// ALTER across settled receipt history.
+enum CustomerReceiptMethod {
+  CASH
+  BANK
+  MPESA
+}
+
+/// MONEY COMING IN from a customer against what they already owe.
+///
+/// An IMMUTABLE POSTED FACT: migration 0020 refuses UPDATE and DELETE outright, the
+/// same discipline as `stock_movements` (0005), `sale_tenders` (0006),
+/// `etims_invoices` (0016), `goods_receipts` (0017) and `supplier_payments` (0018).
+/// A receipt records that money ARRIVED. A receipt entered in error is corrected by
+/// a separate document, which keeps both visible — and that document (a customer
+/// credit note / bad-debt write-off) is deliberately out of scope, which is exactly
+/// why this trigger must stand: nobody can quietly delete the problem instead.
+model CustomerReceipt {
+  id String @id @default(uuid())
+
+  /// Sequential per tenant from a per-schema sequence, exactly like `poNumber`,
+  /// `grnNumber` and `paymentNumber`: monotonic and unique, NOT gap-free, because a
+  /// sequence is non-transactional and a rolled-back receipt legitimately burns a
+  /// number. A missing internal receipt number has no regulatory meaning; two
+  /// receipts sharing one would be a reconciliation defect.
+  receiptNumber Int @unique
+
+  /// REQUIRED, unlike `Sale.customerId`. A walk-in cash sale needs no customer, but
+  /// money received against a receivable is BY DEFINITION received from the person
+  /// who owes it — an unattributed receipt could not reduce anybody's
+  /// `creditBalance` and would put the customer subledger out of step with GL 1100.
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+
+  receiptDate DateTime @db.Date
+  method      CustomerReceiptMethod
+
+  /// The amount that arrived, in KES cents. Strictly positive (CHECK) — a negative
+  /// receipt would be a refund TO the customer, which is a different document with a
+  /// different ledger effect, and expressing it as a negative receipt would make
+  /// every cash-in report wrong.
+  amount BigInt
+
+  /// The external reference: an M-Pesa code, a cheque number, a bank transfer ref.
+  reference String?
+  notes     String?
+
+  createdById String
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+
+  allocations CustomerReceiptAllocation[]
+
+  @@index([customerId])
+  @@index([receiptDate])
+  @@map("customer_receipts")
+}
+
+/// WHICH CREDIT SALES A RECEIPT PAID. The link that turns "the customer brought in
+/// 5,000" into "sale 118 is settled and sale 119 is half paid".
+///
+/// `SUM(allocations.amount) == receipt.amount` ALWAYS, enforced by DEFERRED
+/// constraint triggers bound to BOTH tables. There is NO on-account customer credit
+/// balance in this build: every shilling received is pointed at a sale. A customer
+/// paying more than they owe would be a balance in THEIR favour — a liability with
+/// its own recognition rules — and inventing one as "a receipt with no allocations"
+/// would leave `creditBalance` and GL 1100 disagreeing with nothing to explain it.
+model CustomerReceiptAllocation {
+  id String @id @default(uuid())
+
+  receiptId String
+  receipt   CustomerReceipt @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+
+  saleId String
+  sale   Sale   @relation(fields: [saleId], references: [id], onDelete: Restrict)
+
+  /// Strictly positive (CHECK). Capped by the sale's outstanding credit receivable
+  /// in the service, and backstopped by the deferred `arReceived <= SUM(credit
+  /// tenders)` constraint.
+  amount BigInt
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  /// One allocation per sale per receipt: two rows for the same pair would make "how
+  /// much of this receipt settled that sale" ambiguous, and would let a service bug
+  /// double-apply without the database noticing.
+  @@unique([receiptId, saleId])
+  @@index([saleId])
+  @@map("customer_receipt_allocations")
+}
+
+// ===========================================================================
+// PAYROLL (Module 8, Task 8.1) — statutory config, employee master, the
+// gross-to-net engine's inputs, and the payroll run that accrues it.
+//
+// `src/services/payroll.ts` is the ONLY module permitted to write any table here
+// and the only poster of payroll GL. `src/lib/payroll-math.ts` is the PURE engine:
+// it imports no database client at all, which is what lets the worked examples be
+// checked as arithmetic rather than as a system test.
+//
+// THIS IS THE ACCRUAL HALF. A run posts what is OWED — gross to expense, each
+// statutory head to its own liability, net pay to 2120 — and pays nobody. Settling
+// 2120 and remitting 2200/2210/2220/2230 to cash is Task 8.2 — see PAYROLL
+// SETTLEMENT below. The plug was real: the liabilities landed in their own accounts
+// from day one, so settlement was new rows and a new service, not an ALTER across
+// posted payroll.
+//
+// PAYROLL TOUCHES NO STOCK TABLE, NEVER POSTS TO 1200, AND NEVER TOUCHES REVENUE.
+// Paying people is not a stock movement and not a sale.
+// ===========================================================================
+
+/// The scope of the employment relationship. MONTHLY SALARIED IS THE ONLY SHAPE
+/// THIS TASK COMPUTES; the enum is the PLUG so that hourly, casual day-rate and
+/// contract-specific treatment arrive as new rows and a new branch in the engine
+/// rather than as an ALTER across live employee records.
+enum EmploymentType {
+  PERMANENT
+  CONTRACT
+  CASUAL
+}
+
+enum EmployeeStatus {
+  ACTIVE // included in a new payroll run
+  SUSPENDED // excluded from new runs; the record and its history stay
+  TERMINATED // excluded from new runs; terminal
+}
+
+/// How an employee is paid. Net-pay settlement (Task 8.2) SNAPSHOTS it onto the
+/// employee's `NetPayPaymentLine` for the bank payment file; it does NOT pick the GL
+/// credit account — a run is paid from the ONE account its settlement names.
+enum EmployeePaymentMethod {
+  CASH
+  BANK
+  MPESA
+}
+
+/// `DRAFT -> APPROVED | CANCELLED`; `APPROVED -> POSTED | CANCELLED`;
+/// `POSTED -> PAID`; `PAID` and `CANCELLED` are TERMINAL. **The accrual is booked
+/// ONLY on the APPROVED -> POSTED transition**, so a DRAFT can be recomputed as often
+/// as the payroll officer likes without any financial effect — which is the whole
+/// reason DRAFT exists as a state rather than a flag.
+///
+/// PAID (Task 8.2) means the run's NET PAY has been settled out of 2120 by its one
+/// `NetPayPayment`. It says nothing about the four statutory heads: those are remitted
+/// to their authorities on their own calendar by `StatutoryRemittance`, often
+/// consolidated, so a run's statutory position is read from its remittances rather
+/// than from a status. Migration 0022 refuses POSTED -> PAID unless the settlement row
+/// exists, and refuses the settlement unless the run is POSTED.
+enum PayrollRunStatus {
+  DRAFT
+  APPROVED
+  POSTED
+  PAID
+  CANCELLED
+}
+
+/// Which cash account a payroll settlement credits: CASH -> 1000 Cash on Hand,
+/// BANK -> 1020 Bank Account, MPESA -> 1010 M-Pesa Till. **MPESA RECORDS, IT DOES NOT
+/// DISBURSE** — there is no B2C payout here, exactly as `SupplierPaymentMethod.MPESA`
+/// records rather than initiates. Wiring a real disbursement later is a new service
+/// over the existing per-tenant credential store, not an ALTER across settled payroll.
+/// A PRODUCT'S VAT STATUS under the VAT Act 2013 (Task 3B.1). Zero-rated supplies are
+/// VATABLE at 0% (the seller may still recover input VAT); exempt supplies are outside
+/// VAT altogether. Both charge no output VAT, and the difference matters to KRA, which
+/// is why it is a class rather than a rate of zero.
+enum TaxClass {
+  STANDARD_RATED
+  ZERO_RATED
+  EXEMPT
+}
+
+/// KRA's eTIMS tax-type code (TIS for OSCU/VSCU v2.0): B = standard rate, C = zero-rated
+/// 0%, A = exempt, D = non-VAT (every line of a seller not registered for VAT). E — the
+/// former 8% petroleum rate, deleted from July 2023 — is deliberately absent.
+enum KraTaxCode {
+  A
+  B
+  C
+  D
+}
+
+enum PayrollSettlementMethod {
+  CASH
+  BANK
+  MPESA
+}
+
+/// The four statutory heads a payroll accrual credits, each with its own liability
+/// account and its own authority: PAYE -> 2200 (KRA), NSSF -> 2210 (NSSF), SHIF ->
+/// 2220 (SHA), HOUSING_LEVY -> 2230 (KRA, filed with PAYE).
+enum StatutoryType {
+  PAYE
+  NSSF
+  SHIF
+  HOUSING_LEVY
+}
+
+/// THE EFFECTIVE-DATED STATUTORY RULESET — the single source of every payroll rate
+/// in the system.
+///
+/// **NO STATUTORY FIGURE IS A CONSTANT IN CODE.** the engineering ledger "Configurable Statutory &
+/// Regulatory Values" requires it, and the reason is concrete: PAYE bands, NSSF
+/// limits, the SHIF rate and the Housing Levy all change by finance act or
+/// regulation, and a payroll run for a PAST period must stay correct against the
+/// rates that were in force THEN. So a run records WHICH schedule it used
+/// (`PayrollRun.statutoryScheduleId`) and a rate change is a NEW dated row, never an
+/// edit to the old one.
+///
+/// EXACTLY ONE schedule may cover any given date: migration 0021 enforces
+/// non-overlap with a GiST EXCLUSION constraint over
+/// `daterange(effectiveFrom, effectiveTo, '[)')`, so two schedules claiming the same
+/// month is unrepresentable rather than merely unlikely. A period with no covering
+/// schedule REFUSES the run — it never falls back to "the latest", because silently
+/// computing February on March's rates is exactly the error this table exists to
+/// prevent.
+///
+/// `source` and `verifiedOn` are NOT decoration. The engineering ledger requires that the
+/// in-force figures be verified against an authoritative source at implementation
+/// time and that the source and date be recorded, precisely so the next person does
+/// not have to take the numbers on trust.
+model StatutorySchedule {
+  id String @id @default(uuid())
+
+  /// A human label for the ruleset, e.g. "KE-2026-02".
+  label String @unique
+
+  /// The half-open window this ruleset governs: `[effectiveFrom, effectiveTo)`.
+  /// A NULL `effectiveTo` means OPEN-ENDED — the currently in-force schedule.
+  effectiveFrom DateTime  @db.Date
+  effectiveTo   DateTime? @db.Date
+
+  /// Where the figures came from, and when they were checked. See the model note.
+  source     String
+  verifiedOn DateTime @db.Date
+  notes      String?
+
+  /// Monthly personal relief, in KES cents. Subtracted from the PAYE computed on the
+  /// bands — it is a RELIEF against tax, not a deduction from taxable pay, and the
+  /// engine keeps that distinction because conflating them changes the answer.
+  personalRelief BigInt
+
+  /// NSSF: a RATE as a Decimal percentage, never money. The employee's contribution
+  /// is this rate on pensionable pay capped at the UPPER earnings limit, and the
+  /// employer matches it. Tier I and Tier II are both the same percentage, so the
+  /// employee total is uniform up to the cap and the tier split is presentational.
+  nssfRatePercent Decimal @db.Decimal(5, 2)
+
+  /// The Lower Earnings Limit, in cents. It is the Tier I / Tier II BOUNDARY, not a
+  /// floor on the contribution: it is recorded because the split is reportable and
+  /// because a future year's rules may price the tiers differently.
+  nssfLowerLimit BigInt
+
+  /// The Upper Earnings Limit, in cents. Pensionable pay is capped here.
+  nssfUpperLimit BigInt
+
+  /// SHIF: a RATE as a Decimal percentage on GROSS pay, with no upper cap.
+  shifRatePercent Decimal @db.Decimal(5, 2)
+
+  /// The statutory MINIMUM monthly SHIF contribution, in cents. A low earner pays
+  /// this rather than the percentage, which is why the engine takes a maximum of the
+  /// two rather than just applying the rate.
+  shifMinimum BigInt
+
+  /// Affordable Housing Levy: a RATE as a Decimal percentage on gross, matched by
+  /// the employer.
+  ahlRatePercent Decimal @db.Decimal(5, 2)
+
+  /// THE NATIONAL STANDARD VAT RATE (Task 3B.1) — a RATE as a Decimal percentage,
+  /// never money. The ONLY source of it in the system (BusinessProfile.defaultVatRate
+  /// was dropped in 0024 so there is no second writable copy). Zero-rated and exempt
+  /// supplies are not rates and are not stored: they are tax CLASSES. Frozen by the
+  /// schedule guard once a payroll run or a sale has used the schedule.
+  vatStandardRate   Decimal  @db.Decimal(5, 2)
+  /// Where the VAT rate came from and when it was checked — the same verify-and-record
+  /// rule as the payroll figures, kept separate because it was verified separately.
+  vatRateSource     String
+  vatRateVerifiedOn DateTime @db.Date
+
+  /// THE TURNOVER TAX RATE (Task 3B.2) — a RATE as a Decimal percentage on gross
+  /// turnover, never money. Accrued per sale by a TURNOVER_TAX tenant only. Frozen by
+  /// the schedule guard once sales fall under the schedule, like the VAT rate.
+  totRatePercent    Decimal  @db.Decimal(5, 2)
+  totRateSource     String
+  totRateVerifiedOn DateTime @db.Date
+
+  /// WHO CREATED THIS VERSION (Task 3B.3) — the platform user id of the MSME_OWNER who
+  /// superseded the previous version through the API. NULL means a SYSTEM SEED (the
+  /// platform-run seeder, at provisioning or migration). A String with no foreign key,
+  /// as everywhere a platform user is referenced from a tenant schema.
+  createdById       String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  bands PayeBand[]
+  runs  PayrollRun[]
+
+  @@index([effectiveFrom])
+  @@map("statutory_schedules")
+}
+
+/// ONE PAYE BAND of a schedule. The bands are a CONTIGUOUS, ASCENDING partition of
+/// taxable pay starting at zero, with exactly one open-topped band at the end —
+/// enforced by a DEFERRED constraint trigger in migration 0021, because a gap or an
+/// overlap between bands would silently under- or over-tax every employee whose pay
+/// fell in it, and no per-row CHECK can see the neighbouring band.
+model PayeBand {
+  id         String            @id @default(uuid())
+  scheduleId String
+  schedule   StatutorySchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+
+  /// Position in the ladder, from 1. The contiguity rule is expressed over this.
+  ordinal Int
+
+  /// The band is `[lowerBound, upperBound)` in cents of monthly taxable pay.
+  /// `upperBound` NULL means the TOP band — unbounded above.
+  lowerBound BigInt
+  upperBound BigInt?
+
+  /// A RATE as a Decimal percentage, never money.
+  ratePercent Decimal @db.Decimal(5, 2)
+
+  @@unique([scheduleId, ordinal])
+  @@map("paye_bands")
+}
+
+/// AN EMPLOYEE. Tenant-scoped like everything else in this datamodel.
+///
+/// `basicSalary` and the allowances are the CURRENT standing terms. A payroll run
+/// SNAPSHOTS them into its payslips, so editing an employee never changes a payslip
+/// that has already been computed — see `PayslipEarning`.
+model Employee {
+  id String @id @default(uuid())
+
+  /// Sequential per tenant from a per-schema sequence, like every other document
+  /// number in this system: monotonic and unique, NOT gap-free.
+  employeeNumber Int @unique
+
+  firstName String
+  lastName  String
+
+  /// Statutory identifiers. Nullable because an MSME often hires before the numbers
+  /// are in hand, and refusing the record would push the employee off the books
+  /// entirely — which is worse than an incomplete field. Filing (Task 8.2) is where
+  /// their absence becomes an error.
+  nationalId String?
+  kraPin     String?
+  nssfNumber String?
+  shifNumber String?
+
+  employmentType EmploymentType @default(PERMANENT)
+  status         EmployeeStatus @default(ACTIVE)
+
+  hireDate        DateTime  @db.Date
+  terminationDate DateTime? @db.Date
+
+  /// Monthly basic pay in KES cents. BigInt, never a float.
+  basicSalary BigInt
+
+  paymentMethod EmployeePaymentMethod @default(BANK)
+  bankName      String?
+  bankAccount   String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  allowances         EmployeeAllowance[]
+  payslips           Payslip[]
+  netPayPaymentLines NetPayPaymentLine[]
+
+  @@index([status])
+  @@index([lastName, firstName])
+  @@map("employees")
+}
+
+/// A FIXED RECURRING MONTHLY ALLOWANCE — house, transport, and the like.
+///
+/// `taxable` is the field that matters: a taxable allowance is part of the pay PAYE
+/// is computed on, a non-taxable one is paid but not taxed. Both are part of gross
+/// (and therefore of NSSF/SHIF/AHL, which are computed on gross), which is why the
+/// engine carries `grossPay` and `taxableGross` as two separate figures rather than
+/// one.
+///
+/// Variable pay — overtime, bonuses, backpay, benefits in kind — is DEFERRED. This
+/// table is deliberately only the standing monthly terms.
+model EmployeeAllowance {
+  id         String   @id @default(uuid())
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  name   String
+  /// Monthly amount in KES cents. Non-negative (CHECK).
+  amount BigInt
+
+  taxable Boolean @default(true)
+
+  @@index([employeeId])
+  @@map("employee_allowances")
+}
+
+/// ONE MONTH'S PAYROLL.
+///
+/// At most one non-CANCELLED run per calendar month (partial unique index in 0021):
+/// two payrolls for the same month would double the accrual and double what every
+/// statutory head is owed.
+model PayrollRun {
+  id String @id @default(uuid())
+
+  /// Sequential per tenant from a per-schema sequence.
+  runNumber Int @unique
+
+  periodYear  Int
+  /// 1-12 (CHECK).
+  periodMonth Int
+
+  status PayrollRunStatus @default(DRAFT)
+
+  /// When the net pay is intended to reach employees. The ACCRUAL entry is dated to
+  /// it, because that is the date the obligation is settled against.
+  payDate DateTime @db.Date
+
+  /// WHICH RULESET COMPUTED THIS RUN. Recorded for audit and immutable once set: a
+  /// payslip can only be re-derived if the rates it used are knowable, and "the
+  /// current schedule" stops being the right answer the moment the rates change.
+  statutoryScheduleId String
+  statutorySchedule   StatutorySchedule @relation(fields: [statutoryScheduleId], references: [id])
+
+  /// The accrual entry, set on the APPROVED -> POSTED transition and never again.
+  journalEntryId String? @unique
+
+  createdById  String
+  approvedById String?
+  postedAt     DateTime? @db.Timestamptz(3)
+  notes        String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  payslips Payslip[]
+
+  /// The run's ONE net-pay settlement (Task 8.2). Present exactly when the run is PAID.
+  netPayPayment NetPayPayment?
+
+  /// Statutory remittances TAGGED to this run. A remittance may also stand untagged
+  /// (a manual consolidation across months), so this is not the whole of what the
+  /// four heads have been paid — only what was attributed to this payroll.
+  statutoryRemittances StatutoryRemittance[]
+
+  @@index([status])
+  @@index([periodYear, periodMonth])
+  @@map("payroll_runs")
+}
+
+/// ONE EMPLOYEE'S COMPUTATION FOR ONE RUN — the immutable snapshot of what the
+/// engine decided.
+///
+/// EVERY INTERMEDIATE FIGURE IS STORED, not just the net. That is deliberate: a
+/// payslip has to be defensible to the employee and to KRA years later, and
+/// recomputing it then would need the engine, the employee's terms AND the schedule
+/// all exactly as they were. Storing the working makes the payslip self-contained.
+///
+/// All amounts are BigInt KES cents and all are non-negative (CHECK) — no component
+/// of a payslip can ever be negative, which is the structural form of "a deduction
+/// can never exceed what it is deducted from".
+model Payslip {
+  id           String     @id @default(uuid())
+  payrollRunId String
+  payrollRun   PayrollRun @relation(fields: [payrollRunId], references: [id], onDelete: Cascade)
+
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id])
+
+  /// basic + EVERY allowance. The base for NSSF, SHIF and AHL.
+  grossPay BigInt
+
+  /// basic + only the TAXABLE allowances. The base PAYE is ultimately computed from.
+  taxableGross BigInt
+
+  /// 6% of pensionable pay capped at the UEL, and the employer's matching share.
+  nssfEmployee BigInt
+  nssfEmployer BigInt
+
+  /// The Tier I / Tier II split of the employee's contribution, stored because it is
+  /// reportable to NSSF. Both tiers carry the same rate today, so the SPLIT is
+  /// presentational and `nssfTier1 + nssfTier2 == nssfEmployee` (CHECK) — recorded
+  /// now so a future year that prices the tiers differently is a schedule change
+  /// rather than a migration across posted payslips.
+  nssfTier1 BigInt
+  nssfTier2 BigInt
+
+  shifEmployee BigInt
+
+  ahlEmployee BigInt
+  ahlEmployer BigInt
+
+  /// `taxableGross − nssfEmployee − shifEmployee − ahlEmployee`. The three statutory
+  /// employee contributions are ALLOWABLE DEDUCTIONS against taxable pay under the
+  /// Tax Laws (Amendment) Act 2024 — they reduce the income PAYE is computed on,
+  /// they are not reliefs against the tax. See the engineering ledger "Payroll".
+  taxablePay BigInt
+
+  /// PAYE from the bands, before personal relief.
+  payeBeforeRelief BigInt
+
+  /// The relief actually used — capped at `payeBeforeRelief`, so it can never create
+  /// a negative tax or a refund.
+  personalReliefApplied BigInt
+
+  /// `max(0, payeBeforeRelief − personalRelief)`.
+  paye BigInt
+
+  /// `nssfEmployee + shifEmployee + ahlEmployee + paye`.
+  totalEmployeeDeductions BigInt
+
+  /// `grossPay − totalEmployeeDeductions`.
+  netPay BigInt
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  earnings PayslipEarning[]
+
+  /// The settlement line that paid this payslip's net, once the run is PAID.
+  netPayPaymentLine NetPayPaymentLine?
+
+  @@unique([payrollRunId, employeeId])
+  @@index([employeeId])
+  @@map("payslips")
+}
+
+/// THE EARNINGS AS THEY STOOD WHEN THE RUN WAS COMPUTED — basic plus each allowance,
+/// copied rather than referenced.
+///
+/// WHY A COPY AND NOT A JOIN: an employee's salary will be revised, and a payslip
+/// that read through to the live record would silently restate itself afterwards —
+/// so last year's payslip would stop agreeing with last year's journal entry and
+/// with what the employee was actually paid. The copy is what makes a posted payslip
+/// a historical fact.
+model PayslipEarning {
+  id        String  @id @default(uuid())
+  payslipId String
+  payslip   Payslip @relation(fields: [payslipId], references: [id], onDelete: Cascade)
+
+  name    String
+  /// Cents, non-negative (CHECK).
+  amount  BigInt
+  taxable Boolean
+
+  @@index([payslipId])
+  @@map("payslip_earnings")
+}
+
+// ===========================================================================
+// PAYROLL SETTLEMENT (Module 8, Task 8.2, migration 0022)
+//
+// The pay-out half of payroll. Task 8.1 left a POSTED run whose accrual sits as
+// credit balances in 2120 Net Salaries Payable and the four statutory liabilities.
+// This settles them to cash, and posts NOTHING ELSE:
+//
+//   net pay      Dr 2120 Net Salaries Payable          / Cr 1000 | 1020 | 1010
+//   remittance   Dr 2200 | 2210 | 2220 | 2230 (by head) / Cr 1000 | 1020 | 1010
+//
+// SETTLEMENT MOVES A LIABILITY TO CASH, NOTHING ELSE. It never touches 1200, any
+// stock table, any revenue account or any expense account: the expense was
+// recognised by the accrual, and paying it is not a second cost.
+//
+// `src/services/payroll-settlement.ts` is the SOLE writer of all three tables and the
+// sole poster of settlement GL. The run's flip to PAID goes through
+// `src/services/payroll.ts`, which remains the only writer of `payroll_runs`.
+// ===========================================================================
+
+/// THE SETTLEMENT OF ONE RUN'S NET PAY — exactly one per run (unique `payrollRunId`).
+///
+/// ONE settlement, ONE cash account: in MVP the business pays the whole run from one
+/// account, so the GL carries a single `Dr 2120 / Cr cash` pair. The per-employee
+/// method is recorded on the LINES for the bank file a later task will build, and is
+/// deliberately NOT split in the ledger — the money left one account.
+///
+/// IMMUTABLE once written (no UPDATE, no DELETE — trigger), the same discipline as
+/// supplier payments and customer receipts: it records that money LEFT.
+model NetPayPayment {
+  id String @id @default(uuid())
+
+  payrollRunId String     @unique
+  payrollRun   PayrollRun @relation(fields: [payrollRunId], references: [id])
+
+  /// The date the money left. The settlement entry is dated to it. A DATE, like the
+  /// run's `payDate`, so no settlement figure depends on a clock comparison.
+  paymentDate DateTime @db.Date
+
+  method PayrollSettlementMethod
+
+  /// Σ the run's payslip `netPay`, in cents. NOT client-supplied: the service derives
+  /// it, and migration 0022's deferred constraint pins it to the payslips AND to the
+  /// lines, so it cannot disagree with either.
+  totalNet BigInt
+
+  reference String?
+  notes     String?
+
+  /// The `Dr 2120 / Cr cash` entry. NULL only when `totalNet` is zero (a run whose
+  /// every payslip nets to nothing owes nothing, and a zero entry cannot be posted) —
+  /// CHECK-enforced both ways.
+  journalEntryId String? @unique
+
+  createdById String
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+
+  lines NetPayPaymentLine[]
+
+  @@index([paymentDate])
+  @@map("net_pay_payments")
+}
+
+/// ONE EMPLOYEE'S SHARE of a net settlement — an AUDIT line, not an independently
+/// payable item. Exactly one per payslip of the run, each for exactly that payslip's
+/// `netPay` (trigger-enforced), so `Σ lines == totalNet` and every employee is
+/// accounted for.
+///
+/// `method`, `bankName` and `bankAccount` are a SNAPSHOT of the employee's payment
+/// details at settlement — what a bank payment file needs — copied rather than read
+/// through, for the same reason payslip earnings are: an employee changing banks next
+/// month must not restate where this month's salary went.
+model NetPayPaymentLine {
+  id String @id @default(uuid())
+
+  netPayPaymentId String
+  netPayPayment   NetPayPayment @relation(fields: [netPayPaymentId], references: [id], onDelete: Cascade)
+
+  /// Unique: a payslip's net is settled once, ever.
+  payslipId String  @unique
+  payslip   Payslip @relation(fields: [payslipId], references: [id])
+
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id])
+
+  /// Cents. Equals the payslip's `netPay` exactly (trigger).
+  amount BigInt
+
+  method      EmployeePaymentMethod
+  bankName    String?
+  bankAccount String?
+
+  @@index([netPayPaymentId])
+  @@index([employeeId])
+  @@map("net_pay_payment_lines")
+}
+
+/// REMITTING ONE STATUTORY HEAD TO ITS AUTHORITY.
+///
+/// Posts `Dr <head liability> / Cr <cash>`. **It may never take the head into a
+/// debit balance** — you cannot remit more than you owe — and when tagged to a run it
+/// may never exceed what THAT run accrued for the head. Both are checked by the
+/// service with a clear message and by migration 0022's deferred constraint at COMMIT.
+///
+/// `payrollRunId` is OPTIONAL: an employer often remits one month's PAYE alone, but
+/// may also pay arrears or a consolidation in one go. Cross-run consolidation
+/// reporting is Module 13.
+///
+/// IMMUTABLE (no UPDATE, no DELETE — trigger). A mis-remittance is corrected by the
+/// authority's own refund or offset, recorded as a new document, never by editing
+/// this one.
+model StatutoryRemittance {
+  id String @id @default(uuid())
+
+  statutoryType StatutoryType
+
+  /// Cents, strictly positive (CHECK).
+  amount BigInt
+
+  /// The date the money left. The remittance entry is dated to it.
+  remittanceDate DateTime @db.Date
+
+  method PayrollSettlementMethod
+
+  /// The authority's own payment reference (KRA PRN, NSSF or SHA receipt).
+  reference String?
+  notes     String?
+
+  payrollRunId String?
+  payrollRun   PayrollRun? @relation(fields: [payrollRunId], references: [id])
+
+  /// The `Dr <head> / Cr cash` entry. Always present — the amount is positive.
+  journalEntryId String @unique
+
+  createdById String
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([statutoryType])
+  @@index([payrollRunId])
+  @@index([remittanceDate])
+  @@map("statutory_remittances")
+}
+
+// ===========================================================================
+// EXPENSES (Task T-A9, migration 0028) — a thin record of one PAID operating expense.
+// Its financial effect is ONE balanced journal entry (Dr 6xxx / Cr 1000 | 1010 | 1020)
+// posted through the ledger in the same transaction; both are immutable and a mistake is
+// VOIDED with a reversing entry. Paid-now only and no input VAT yet (product-owner
+// decisions; see the migration). Written only by src/services/expenses.ts.
+// ===========================================================================
+enum ExpensePaymentMethod {
+  CASH
+  MPESA
+  BANK
+}
+
+model Expense {
+  id              String               @id @default(uuid())
+  expenseDate     DateTime             @db.Date
+  /// The expense account's code (6000–6999, excluding module-owned accounts).
+  category        String
+  payee           String?
+  description     String
+  paymentMethod   ExpensePaymentMethod
+  amountCents     BigInt
+  /// Pinned to 0 by CHECK until input-VAT apportionment is resolved.
+  vatInputCents   BigInt               @default(0)
+  reference       String?
+  journalEntryId  String               @unique
+  isVoided        Boolean              @default(false)
+  voidedByEntryId String?              @unique
+  voidedAt        DateTime?            @db.Timestamptz(3)
+  voidReason      String?
+  createdBy       String
+  createdAt       DateTime             @default(now()) @db.Timestamptz(3)
+
+  @@index([expenseDate])
+  @@index([category])
+  @@map("expenses")
+}

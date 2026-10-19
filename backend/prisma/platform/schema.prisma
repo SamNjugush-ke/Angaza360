@@ -1,0 +1,803 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../../src/generated/platform"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// PLATFORM / IDENTITY LAYER — lives in the shared "public" schema.
+//
+// Tenant and User are the registry that must be resolvable BEFORE a tenant's
+// isolated schema can even be selected (e.g. resolving which tenant a login
+// belongs to). This is the one deliberate exception to schema-per-tenant
+// isolation, and it matches the spec's own §7.2 data model exactly.
+//
+// Business-data models (Product, and everything that follows it: orders,
+// ledger entries, customers, etc.) carry NO tenantId column. Each one is
+// deployed, unmodified, into every tenant's own Postgres schema
+// (tenant_<id>) via a per-tenant migration/provisioning step. Isolation for
+// those models comes from which schema the Prisma connection is pointed at
+// for a given request, never from a foreign key. Prisma's static
+// `multiSchema` preview feature is intentionally NOT used here — it requires
+// an enumerated, fixed list of schema names at generate time, which cannot
+// express tenant schemas that are created dynamically and are unbounded in
+// number.
+// ---------------------------------------------------------------------------
+
+enum TenantIsolationTier {
+  SHARED_POOL // schema-per-tenant in the shared cluster (Mwanzo/Ukuaji)
+  DEDICATED_SCHEMA // dedicated schema, enhanced RLS (Biashara/Mstawi)
+  DEDICATED_INSTANCE // dedicated Cloud SQL instance + GKE namespace (Enterprise)
+}
+
+enum TenantStatus {
+  PENDING_PROVISIONING
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+enum SubscriptionTier {
+  MWANZO
+  UKUAJI
+  BIASHARA
+  MSTAWI
+  ENTERPRISE
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  GRACE_PERIOD
+  SUSPENDED
+  CANCELLED
+}
+
+enum TaxRegime {
+  VAT
+  TURNOVER_TAX
+  EXEMPT
+}
+
+model Tenant {
+  id String @id @default(uuid())
+
+  // Registration / identity
+  name           String
+  businessSector String?
+  kraPin         String?
+  taxRegime      TaxRegime @default(TURNOVER_TAX)
+  currency       String    @default("KES")
+
+  // Routing (§4.5 Tenant Routing & Subdomain Architecture)
+  subdomain    String  @unique // [subdomain].angaza360.co.ke
+  customDomain String? @unique // CNAME target, Pro+ plans only
+
+  // Schema isolation (§4.4 Multi-Tenancy Implementation)
+  dbSchema      String              @unique // physical Postgres schema, e.g. tenant_7f3a2c
+  isolationTier TenantIsolationTier @default(SHARED_POOL)
+  status        TenantStatus        @default(PENDING_PROVISIONING)
+
+  // Subscription status (full billing/invoice detail is out of scope here —
+  // Module 13's Subscription/Invoice models are a separate concern)
+  subscriptionTier     SubscriptionTier   @default(MWANZO)
+  subscriptionStatus   SubscriptionStatus @default(TRIALING)
+  subscriptionRenewsAt DateTime? @db.Timestamptz(3)
+  donorProjectCode     String?
+
+  // Portal branding (§6.1.3 Portal Customization)
+  brandPrimaryColor String?
+  brandLogoUrl      String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  users User[]
+
+  invitations UserInvitation[]
+
+  donorMemberships DonorProjectMembership[]
+
+  mentorshipEngagements MentorshipEngagement[]
+  mentorshipAccessLogs  MentorshipAccessLog[]
+
+  @@map("tenants")
+}
+
+enum UserRole {
+  SUPER_ADMIN // Angaza platform-wide super-admin
+  PROGRAM_OFFICER // Angaza program/cohort management, read access across tenants
+  MSME_OWNER // full tenant access
+  MSME_MANAGER // operational access (no billing/settings)
+  ACCOUNTANT // accounts, payroll, tax, financial reports
+  CASHIER // POS terminal only
+  WAREHOUSE_STAFF // stock in/out, reorder alerts
+  HR_OFFICER // employee records, leave, payroll processing
+  VIEWER_AUDITOR // read-only across modules
+
+  // RBAC READINESS for the post-MVP mentorship module (Task OFF.1). These are
+  // VALID roles today — they resolve through the same session/RBAC gate as every
+  // other role — but NOTHING gates on them: no route lists MENTOR or COACH in a
+  // requireRole(...) call, so a user holding one has NO tenant-write permission
+  // of any kind and is refused by every guarded route. They are added now,
+  // additively, so that enabling mentorship later is new routes and new rows
+  // rather than an ALTER TYPE against a live identity table mid-feature.
+  MENTOR // an assigned business mentor, read-only placeholder posture
+  COACH // an AI/human coaching persona, read-only placeholder posture
+}
+
+model User {
+  id String @id @default(uuid())
+
+  // Nullable: Angaza staff (SUPER_ADMIN, PROGRAM_OFFICER) are platform-wide
+  // and are not scoped to a single tenant.
+  tenantId String?
+  tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // Optional: Firebase is not the only identity source. A user may instead
+  // authenticate by email + password (passwordHash below), in which case they
+  // have no Firebase Auth UID. Exactly one identity source is expected per user.
+  authUid  String? @unique // Firebase Auth UID (§5.2, §10.2), null for password users
+  email    String  @unique
+  phone    String? @unique
+  fullName String
+  /// The person's National ID (Task T-A6.1), captured for a business owner at onboarding.
+  /// Unique when present (partial unique index in 20261019100000).
+  nationalId String?
+
+  // Password credentials (scrypt via src/auth/password.ts). Null for users who
+  // authenticate through Firebase. Never stores the plaintext password.
+  passwordHash      String?
+  passwordUpdatedAt DateTime? @db.Timestamptz(3)
+
+  role       UserRole
+  isActive   Boolean  @default(true)
+  mfaEnabled Boolean  @default(false)
+
+  lastLoginAt DateTime? @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+
+  sessions Session[]
+
+  // Password recovery (Task T-A4).
+  passwordResetTokens PasswordResetToken[]
+
+  // Staff invitations (Task T-A5).
+  invitationsSent     UserInvitation[] @relation("InvitationInvitedBy")
+  invitationsAccepted UserInvitation[] @relation("InvitationAcceptedUser")
+
+  // Mentorship (Task 14.1).
+  mentorEngagements    MentorshipEngagement[] @relation("EngagementMentor")
+  invitedEngagements   MentorshipEngagement[] @relation("EngagementInvitedBy")
+  consentedEngagements MentorshipEngagement[] @relation("EngagementConsentBy")
+  mentorAccessLogs     MentorshipAccessLog[]
+  createdGoals         Goal[]
+  createdIndicators    PerformanceIndicator[]
+  createdActionItems   ActionItem[]
+  completedActionItems ActionItem[] @relation("ActionItemCompletedBy")
+  createdSessions      CoachingSession[]
+
+  @@index([tenantId])
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// ANGAZA'S OWN integration credentials (Task 3.4). These are the PLATFORM's
+// credentials — the shortcode and integrator credentials Angaza uses to charge
+// SUBSCRIPTIONS to its MSME customers, plus any future platform-level provider
+// (Stripe, SMS to tenants).
+//
+// THEY ARE NEVER A TENANT'S SETTLEMENT CREDENTIALS. Under Option A a tenant's
+// sales settle to that tenant's OWN shortcode, whose credentials live encrypted
+// in that tenant's schema (tenant_integration_credentials). The two stores are
+// physically separate — different schema, different table — precisely so a bug
+// in one cannot reach the other, and so no code path can accidentally bill a
+// tenant's customer into Angaza's till or Angaza's subscription into a tenant's.
+//
+// Same encryption contract as the tenant store: AES-256-GCM ciphertext + iv +
+// authTag + keyRef, no plaintext secret in any column, keyRef carried so
+// app-encrypted rows can be migrated to Cloud KMS by re-encryption alone.
+// provider/environment/status are plain strings here (not enums) because the
+// platform's provider set is Angaza's operational concern and evolves
+// independently of the tenant-facing IntegrationProvider enum.
+// ---------------------------------------------------------------------------
+model PlatformIntegrationCredential {
+  id          String @id @default(uuid())
+  provider    String // "MPESA" (subscription billing) | "STRIPE" | ...
+  environment String // "sandbox" | "production"
+
+  ciphertext String
+  iv         String
+  authTag    String
+  keyRef     String
+
+  status String  @default("PENDING")
+  label  String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@unique([provider, environment])
+  @@map("platform_integration_credentials")
+}
+
+model Session {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // sha256 hex of the refresh token. The raw token is returned to the client
+  // exactly once at issuance and is never persisted.
+  refreshTokenHash String @unique
+
+  issuedAt  DateTime  @default(now()) @db.Timestamptz(3)
+  expiresAt DateTime @db.Timestamptz(3)
+  revokedAt DateTime? @db.Timestamptz(3)
+
+  userAgent String?
+  ipAddress String?
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+// ===========================================================================
+// MENTORSHIP (Module 14, Task 14.1) — PLATFORM-LEVEL, by design.
+//
+// These rows describe the MENTORING RELATIONSHIP, not a business's books, which is why
+// they live in the platform schema and the mentee's tenant schema is untouched. They
+// are the gate for the ONE sanctioned cross-tenant READ in the system: a mentor reads
+// a mentee's books only through an ACTIVE, CONSENTED engagement, the tenant is resolved
+// FROM this record (never from a request), and every read is logged below. See
+// the engineering ledger "Mentorship" and src/services/mentorship/access.ts.
+// ===========================================================================
+
+/// INVITED (an admin proposed it; the mentor has NO access) -> ACTIVE (the mentee
+/// owner consented) | ENDED; ACTIVE -> ENDED; ENDED is terminal. Trigger-enforced, with a
+/// CHECK pinning the fields each status must carry — an ACTIVE row without consent is
+/// unrepresentable.
+enum MentorshipEngagementStatus {
+  INVITED
+  ACTIVE
+  ENDED
+}
+
+/// ONE mentor-to-mentee-business relationship. At most ONE live (non-ENDED) engagement
+/// per mentor-tenant pair (partial unique index); re-engaging after ENDED is a new row,
+/// so the consent history of the old one is never overwritten.
+model MentorshipEngagement {
+  id String @id @default(uuid())
+
+  /// A platform User whose role is MENTOR or COACH and who belongs to NO tenant.
+  mentorId String
+  mentor   User   @relation("EngagementMentor", fields: [mentorId], references: [id], onDelete: Restrict)
+
+  /// The mentee business. Its schema is opened ONLY by the access gate, ONLY while this
+  /// row is ACTIVE.
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  status MentorshipEngagementStatus @default(INVITED)
+
+  /// The admin (SUPER_ADMIN / PROGRAM_OFFICER) who created the invitation.
+  invitedById String
+  invitedBy   User   @relation("EngagementInvitedBy", fields: [invitedById], references: [id], onDelete: Restrict)
+
+  /// CONSENT — set together, once, on INVITED -> ACTIVE. consentByUserId must be an
+  /// MSME_OWNER of THIS tenant (trigger-enforced).
+  consentGivenAt  DateTime? @db.Timestamptz(3)
+  consentByUserId String?
+  consentBy       User?     @relation("EngagementConsentBy", fields: [consentByUserId], references: [id], onDelete: Restrict)
+
+  startedAt   DateTime? @db.Timestamptz(3)
+  endedAt     DateTime? @db.Timestamptz(3)
+  endedReason String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  accessLogs MentorshipAccessLog[]
+  goals      Goal[]
+  indicators PerformanceIndicator[]
+  actionItems ActionItem[]
+  sessions   CoachingSession[]
+
+  @@index([mentorId])
+  @@index([tenantId])
+  @@map("mentorship_engagements")
+}
+
+/// APPEND-ONLY AUDIT of every mentor read of a mentee's data — who, which business, what,
+/// when. Written by the access gate on every successful read; immutable (trigger refuses
+/// UPDATE and DELETE). mentorId and tenantId are copies of the engagement's, pinned to
+/// it by trigger, so the mentee owner reads a self-contained record.
+model MentorshipAccessLog {
+  id String @id @default(uuid())
+
+  engagementId String
+  engagement   MentorshipEngagement @relation(fields: [engagementId], references: [id], onDelete: Restrict)
+
+  mentorId String
+  mentor   User   @relation(fields: [mentorId], references: [id], onDelete: Restrict)
+
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  /// What was read, e.g. "snapshot".
+  resource String
+  viewedAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([engagementId, viewedAt])
+  @@index([tenantId, viewedAt])
+  @@map("mentorship_access_logs")
+}
+
+// ===========================================================================
+// MENTORING RECORDS (Module 14, Task 14.2) — PLATFORM-LEVEL, about the RELATIONSHIP.
+//
+// Goals, agreed indicators, action items and coaching sessions all hang off a
+// MentorshipEngagement. None of them is written to, or read from, the mentee's tenant
+// schema — a mentor writing a goal touches only these tables. The one thing derived
+// from the business's books, an indicator's ACTUAL, is NEVER stored: it is computed
+// live through the 14.1 read-only access gate from the Module 13 engine, and every such
+// read is logged.
+//
+// WRITES REQUIRE AN ACTIVE ENGAGEMENT; an ENDED engagement's records are READ-ONLY
+// history. Enforced by src/services/mentorship/coaching.ts (the sole writer) and by a
+// guard trigger on every table (platform migration 20261011170000).
+// ===========================================================================
+
+enum GoalStatus {
+  OPEN
+  ON_TRACK
+  AT_RISK
+  MET // terminal
+  MISSED // terminal
+}
+
+/// Each maps to ONE Module 13 computation over the engaged business's books, month to
+/// date (see coaching.ts). The first four are MONEY (cents); the last three are RATES.
+enum IndicatorSourceKey {
+  MONTHLY_REVENUE
+  NET_PROFIT
+  CASH_POSITION
+  RECEIVABLES_OUTSTANDING
+  GROSS_MARGIN_PCT
+  SALES_GROWTH_PCT
+  INVENTORY_TURNOVER
+}
+
+enum ActionParty {
+  MENTOR
+  ENTREPRENEUR
+}
+
+enum ActionItemStatus {
+  OPEN
+  DONE // terminal; stamps completedAt
+  CANCELLED // terminal
+}
+
+/// A goal agreed within an engagement. MET and MISSED are terminal.
+model Goal {
+  id           String               @id @default(uuid())
+  engagementId String
+  engagement   MentorshipEngagement @relation(fields: [engagementId], references: [id], onDelete: Restrict)
+
+  title        String
+  description  String?
+  /// A money goal's target, in KES cents.
+  targetValue  BigInt?
+  /// What the target measures, in words (e.g. "monthly revenue").
+  targetMetric String?
+  targetDate   DateTime? @db.Date
+  status       GoalStatus @default(OPEN)
+
+  createdById String
+  createdBy   User   @relation(fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([engagementId])
+  @@map("mentorship_goals")
+}
+
+/// An agreed KPI. ITS ACTUAL IS NOT STORED — it is computed live from the business's
+/// books through the access gate. A target is EITHER an amount (money KPIs) OR a rate
+/// (ratio/percent KPIs), never both and never the wrong kind (CHECK by sourceKey).
+/// Immutable once agreed: a changed target is a new indicator.
+model PerformanceIndicator {
+  id           String               @id @default(uuid())
+  engagementId String
+  engagement   MentorshipEngagement @relation(fields: [engagementId], references: [id], onDelete: Restrict)
+
+  name      String
+  sourceKey IndicatorSourceKey
+  /// Money KPIs only: the target in KES cents.
+  targetAmount BigInt?
+  /// Ratio/percent KPIs only: the target as a decimal (percent points, or times for turnover).
+  targetRate   Decimal? @db.Decimal(9, 2)
+  note         String?
+
+  createdById String
+  createdBy   User   @relation(fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([engagementId])
+  @@map("mentorship_indicators")
+}
+
+/// A concrete action, owned by the mentor or the entrepreneur. DONE and CANCELLED are
+/// terminal; DONE stamps completedAt (CHECK: DONE iff completedAt).
+model ActionItem {
+  id           String               @id @default(uuid())
+  engagementId String
+  engagement   MentorshipEngagement @relation(fields: [engagementId], references: [id], onDelete: Restrict)
+
+  title            String
+  description      String?
+  responsibleParty ActionParty
+  dueDate          DateTime?        @db.Date
+  status           ActionItemStatus @default(OPEN)
+  completedAt      DateTime?        @db.Timestamptz(3)
+  /// Who marked it DONE (Task 14.3): the mentor, or — for an ENTREPRENEUR item only — an
+  /// MSME_OWNER of the engaged business. NULL on an item completed before 14.3, when only
+  /// the mentor could complete one.
+  completedById    String?
+  completedBy      User?            @relation("ActionItemCompletedBy", fields: [completedById], references: [id], onDelete: Restrict)
+
+  createdById String
+  createdBy   User   @relation(fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([engagementId])
+  @@map("mentorship_action_items")
+}
+
+/// A dated coaching check-in. Immutable once recorded — a correction is a new session.
+model CoachingSession {
+  id           String               @id @default(uuid())
+  engagementId String
+  engagement   MentorshipEngagement @relation(fields: [engagementId], references: [id], onDelete: Restrict)
+
+  sessionDate  DateTime @db.Date
+  summary      String
+  observations String?
+  commitments  String?
+
+  createdById String
+  createdBy   User   @relation(fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([engagementId, sessionDate])
+  @@map("mentorship_sessions")
+}
+
+// ===========================================================================
+// NOTIFICATIONS (Task T-A3) — platform-level delivery record.
+//
+// One row per message the platform sends (a password-reset code, a staff
+// invitation). It records WHO it went to, WHICH template, through WHICH provider and
+// how it ended — and deliberately NOT the body: a rendered body can carry a raw
+// single-use token, and the whole point of storing only a token's hash is that the
+// raw value exists nowhere but in the recipient's inbox. Mutable: QUEUED moves to
+// SENT, FAILED or SIMULATED exactly once (src/services/notifications/
+// notification-service.ts is the only writer).
+// ===========================================================================
+
+enum NotificationChannel {
+  SMS
+  EMAIL
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENT
+  FAILED
+  SIMULATED // delivered to the in-process simulator; nothing left the server
+}
+
+model NotificationLog {
+  id                String              @id @default(uuid())
+  channel           NotificationChannel
+  recipient         String
+  templateKey       String
+  /// What the message is about, e.g. "PasswordResetToken" / "UserInvitation", and that row's id.
+  relatedType       String?
+  relatedId         String?
+  status            NotificationStatus  @default(QUEUED)
+  providerName      String
+  providerMessageId String?
+  /// The provider's failure, in words. Never a secret, never the body.
+  error             String?
+  createdAt         DateTime            @default(now()) @db.Timestamptz(3)
+  sentAt            DateTime?           @db.Timestamptz(3)
+
+  @@index([relatedType, relatedId])
+  @@index([createdAt])
+  @@map("notification_logs")
+}
+
+// ===========================================================================
+// PASSWORD RECOVERY (Task T-A4).
+//
+// A reset token is a single-use bearer secret, so it is stored exactly like a refresh
+// token (Session.refreshTokenHash): ONLY its sha256 hex. The raw token leaves the
+// server once, in the notification to its owner, and exists nowhere else. Consumption
+// stamps usedAt, once (trigger-enforced); identity, hash and expiry are frozen.
+// ===========================================================================
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime  @db.Timestamptz(3)
+  usedAt    DateTime? @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+// ===========================================================================
+// THE IDENTITY AUDIT LOG (Task T-A4; extended by T-A5) — APPEND-ONLY.
+//
+// Every identity event — a reset requested or completed, a password changed, and
+// (T-A5) every staff-management action — is one row. The database refuses UPDATE,
+// DELETE and TRUNCATE (same discipline as mentorship_access_logs). The ids are PLAIN
+// columns with NO foreign key on purpose: an audit record must OUTLIVE the user and
+// the tenant it describes, and a FK would either block their removal or rewrite the
+// record (SET NULL), which the append-only rule forbids. metadata never carries a
+// token, a password or any secret.
+// ===========================================================================
+enum AuditAction {
+  PASSWORD_RESET_REQUESTED
+  PASSWORD_RESET_COMPLETED
+  PASSWORD_CHANGED
+  // Staff management (Task T-A5), added by their own migration.
+  USER_INVITED
+  INVITATION_ACCEPTED
+  INVITATION_REVOKED
+  ROLE_CHANGED
+  USER_DEACTIVATED
+  USER_REACTIVATED
+  // Tenant onboarding and lifecycle (Task T-A6.1).
+  TENANT_ONBOARDED
+  TENANT_SUSPENDED
+  TENANT_REACTIVATED
+  TENANT_DEACTIVATED
+  // Tenant applications (Task T-A6.2).
+  APPLICATION_SUBMITTED
+  APPLICATION_APPROVED
+  APPLICATION_REJECTED
+  // Batch onboarding (Task T-A6.3).
+  BATCH_UPLOADED
+  BATCH_COMMITTED
+  // Donor projects / cohorts (Task T-A12).
+  DONOR_PROJECT_CREATED
+  DONOR_MEMBER_ADDED
+  DONOR_MEMBER_REMOVED
+  DONOR_CONSENT_GIVEN
+  DONOR_CONSENT_WITHDRAWN
+  DONOR_PROJECT_CLOSED
+}
+
+model AuditLog {
+  id           String      @id @default(uuid())
+  action       AuditAction
+  /// Who did it; NULL when the actor is unauthenticated (a reset request).
+  actorUserId  String?
+  /// Whom it was done to.
+  targetUserId String?
+  /// The tenant the event belongs to; NULL for a platform-scoped user.
+  tenantId     String?
+  ipAddress    String?
+  metadata     Json?
+  occurredAt   DateTime    @default(now()) @db.Timestamptz(3)
+
+  @@index([tenantId, occurredAt])
+  @@index([targetUserId, occurredAt])
+  @@map("audit_logs")
+}
+
+// ===========================================================================
+// STAFF INVITATIONS (Task T-A5).
+//
+// An invitation grants a ROLE, so it is held to the role-assignment rules by the
+// database as well as the service: a platform role (SUPER_ADMIN, PROGRAM_OFFICER,
+// MENTOR, COACH) is tenantless and only a SUPER_ADMIN may grant one; a tenant role
+// belongs to exactly one tenant and only a SUPER_ADMIN or an active MSME_OWNER OF THAT
+// TENANT may grant it. The token is a single-use bearer secret stored only as its
+// sha256. PENDING -> ACCEPTED | REVOKED | EXPIRED, all terminal; at most ONE PENDING
+// invitation per email.
+// ===========================================================================
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+}
+
+model UserInvitation {
+  id             String           @id @default(uuid())
+  email          String
+  role           UserRole
+  /// NULL exactly when the role is a platform role.
+  tenantId       String?
+  tenant         Tenant?          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  invitedById    String
+  invitedBy      User             @relation("InvitationInvitedBy", fields: [invitedById], references: [id], onDelete: Cascade)
+  tokenHash      String           @unique
+  status         InvitationStatus @default(PENDING)
+  expiresAt      DateTime         @db.Timestamptz(3)
+  acceptedAt     DateTime?        @db.Timestamptz(3)
+  /// Onboarding (Task T-A6.1): the invited owner's National ID, copied onto their user on accept.
+  nationalId     String?
+  acceptedUserId String?
+  acceptedUser   User?            @relation("InvitationAcceptedUser", fields: [acceptedUserId], references: [id], onDelete: Cascade)
+  createdAt      DateTime         @default(now()) @db.Timestamptz(3)
+
+  @@index([tenantId, createdAt])
+  @@index([email])
+  @@map("user_invitations")
+}
+
+// ===========================================================================
+// TENANT APPLICATIONS (Task T-A6.2; batch rows from T-A6.3).
+//
+// A request to onboard a business that is NOT a tenant yet: a public self-serve signup,
+// or a row of an admin batch upload. Nothing is provisioned until a SUPER_ADMIN approves
+// it (self-serve) or commits its batch (batch) — and then only if the green-gate passes
+// AGAIN at that moment. PENDING_APPROVAL -> APPROVED | REJECTED, both terminal.
+// reviewedById / resultingTenantId are plain ids, not foreign keys: the record of a
+// decision outlives the reviewer and the tenant it produced (as audit_logs does).
+// ===========================================================================
+enum TenantApplicationStatus {
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+}
+
+enum TenantApplicationSource {
+  SELF_SERVE
+  ADMIN
+  BATCH
+}
+
+model TenantApplication {
+  id                String                  @id @default(uuid())
+  businessName      String
+  /// The subdomain proposed when the row was last validated; re-checked at approval.
+  proposedSubdomain String?
+  sector            String?
+  kraPin            String?
+  /// BusinessProfile's vocabulary: VAT_REGISTERED | TURNOVER_TAX | EXEMPT.
+  taxRegime         String
+  /// The tier asked for. BILL-LATER: approval provisions it directly (see the billing seam).
+  requestedTier     String?
+  ownerFullName     String
+  ownerEmail        String
+  ownerPhone        String?
+  ownerNationalId   String?
+  status            TenantApplicationStatus @default(PENDING_APPROVAL)
+  source            TenantApplicationSource
+  /// The batch upload a BATCH row belongs to (T-A6.3).
+  batchId           String?
+  batch             OnboardingBatch?        @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  /// The row's data-line number in the uploaded CSV (1 = the first row after the header).
+  batchRowNumber    Int?
+  submittedAt       DateTime                @default(now()) @db.Timestamptz(3)
+  reviewedById      String?
+  reviewedAt        DateTime?               @db.Timestamptz(3)
+  rejectionReason   String?
+  resultingTenantId String?
+  updatedAt         DateTime                @updatedAt @db.Timestamptz(3)
+
+  @@index([status, submittedAt])
+  @@index([batchId])
+  @@map("tenant_applications")
+}
+
+// ===========================================================================
+// BATCH ONBOARDING (Task T-A6.3).
+//
+// One uploaded CSV. Its rows are TenantApplication rows (source BATCH, batchId). PREVIEW
+// while rows are corrected or removed; COMMITTED — terminal — once every remaining row was
+// GREEN and has been provisioned. uploadedById is a plain id (no FK), like the audit log.
+// ===========================================================================
+enum OnboardingBatchStatus {
+  PREVIEW
+  COMMITTED
+}
+
+model OnboardingBatch {
+  id           String                @id @default(uuid())
+  uploadedById String
+  status       OnboardingBatchStatus @default(PREVIEW)
+  createdAt    DateTime              @default(now()) @db.Timestamptz(3)
+  committedAt  DateTime?             @db.Timestamptz(3)
+
+  applications TenantApplication[]
+
+  @@map("onboarding_batches")
+}
+
+// ===========================================================================
+// DONOR PROJECTS / COHORTS (Task T-A12) — platform-level, reusing Module 14's model.
+//
+// A donor-funded programme enrols MSMEs. A member business is in the cohort's AGGREGATE
+// only while its owner has CONSENTED, and every read of a member's books goes through the
+// SAME consented, logged, READ-ONLY gate mentorship uses (src/services/tenant-read-gate.ts),
+// logged here in an append-only table. Nothing is written to a member's tenant schema.
+// ===========================================================================
+enum DonorProjectStatus {
+  ACTIVE
+  CLOSED
+}
+
+enum DonorConsentStatus {
+  PENDING
+  CONSENTED
+  WITHDRAWN
+}
+
+model DonorProject {
+  id          String             @id @default(uuid())
+  /// Matches Tenant.donorProjectCode; businesses carrying it are enrolled at creation.
+  code        String             @unique
+  name        String
+  donor       String
+  description String?
+  status      DonorProjectStatus @default(ACTIVE)
+  createdById String
+  createdAt   DateTime           @default(now()) @db.Timestamptz(3)
+  closedAt    DateTime?          @db.Timestamptz(3)
+
+  memberships DonorProjectMembership[]
+
+  @@map("donor_projects")
+}
+
+model DonorProjectMembership {
+  id              String             @id @default(uuid())
+  projectId       String
+  project         DonorProject       @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  tenantId        String
+  tenant          Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  consentStatus   DonorConsentStatus @default(PENDING)
+  /// The business owner who last consented or withdrew (an MSME_OWNER of THIS tenant).
+  consentByUserId String?
+  consentAt       DateTime?          @db.Timestamptz(3)
+  joinedAt        DateTime           @default(now()) @db.Timestamptz(3)
+
+  @@unique([projectId, tenantId])
+  @@index([tenantId])
+  @@map("donor_project_memberships")
+}
+
+/// APPEND-ONLY: every read of a member business's books for a cohort aggregate — who,
+/// which business, which project, what, when. Plain ids (no FK) so the record outlives
+/// the reader and the tenant; the guard admits a row only for a CONSENTED member of an
+/// ACTIVE project and refuses UPDATE / DELETE.
+model DonorAccessLog {
+  id           String   @id @default(uuid())
+  projectId    String
+  tenantId     String
+  readerUserId String
+  resource     String
+  viewedAt     DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([projectId, viewedAt])
+  @@index([tenantId, viewedAt])
+  @@map("donor_access_logs")
+}

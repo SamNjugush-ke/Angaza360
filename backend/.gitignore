@@ -1,0 +1,10 @@
+node_modules
+# Keep environment variables out of version control
+.env
+
+/src/generated
+
+# Local test environment (Task T-A1). Test-only values, but never committed.
+.env.test
+# ...while its template IS committed (the root .gitignore ignores .env.* except .env.example).
+!.env.test.example

@@ -1,0 +1,88 @@
+# ===========================================================================
+# Backend CI (Task T-A1) — runs the regression suite against a throwaway Postgres.
+#
+# EVERY value in `env:` below is TEST-ONLY and PUBLIC (they mirror
+# backend/.env.test.example). None of them is, or may ever become, a real secret.
+# The database is the CI service container's `angaza_test` — the suite's global
+# setup refuses to run against any database whose name does not match /test/i.
+# ===========================================================================
+name: backend-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    services:
+      postgres:
+        image: postgres:16.9
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: angaza_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d angaza_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/angaza_test?schema=public
+      NODE_ENV: test
+      PORT: "4000"
+      HOST: 127.0.0.1
+      CORS_ORIGIN: http://localhost:3000
+      API_DOCS_ENABLED: "false"
+      JWT_SECRET: t-a1-test-only-jwt-secret-not-a-real-secret-0123456789
+      ACCESS_TOKEN_TTL_SECONDS: "900"
+      REFRESH_TOKEN_TTL_SECONDS: "604800"
+      LOGIN_RATE_LIMIT_MAX: "5"
+      LOGIN_RATE_LIMIT_WINDOW_MS: "60000"
+      SEED_PASSWORD: Test-Only-Throwaway-2026
+      # Base64 of the 32 ASCII bytes "angaza-t-a1-test-key-not-secret!". Public, test-only.
+      CREDENTIAL_ENCRYPTION_KEY: YW5nYXphLXQtYTEtdGVzdC1rZXktbm90LXNlY3JldCE=
+      MPESA_PROVIDER: simulated
+      MPESA_CALLBACK_PATH_SECRET: t-a1-test-only-callback-path-secret
+      MPESA_SIM_DELAY_MS: "1500"
+      ETIMS_PROVIDER: simulated
+      ETIMS_SIM_OUTCOME: sign
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js (matches local 22.16.0)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.16.0"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The generated Prisma clients are git-ignored (src/generated), so both are
+      # generated here before anything imports them.
+      - name: Generate Prisma clients (platform + tenant)
+        run: |
+          npm run platform:generate
+          npm run tenant:generate
+
+      - name: Deploy platform migrations to angaza_test
+        run: npm run platform:deploy
+
+      - name: Type-check the test suite
+        run: npm run test:typecheck
+
+      # Global setup provisions the fixture tenant through provisionTenant() and
+      # reports "26/26 tenant migrations applied".
+      - name: Run the regression suite (with coverage)
+        run: npm run test:ci

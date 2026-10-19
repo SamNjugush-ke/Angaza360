@@ -1,0 +1,18 @@
+# Keep line endings stable across platforms.
+#
+# The tenant migration runner checksums each migration file and refuses to
+# re-run one whose contents changed since it was applied (see
+# backend/src/db/migrations.ts). With core.autocrlf=true on Windows, git writes
+# CRLF into the working tree while storing LF, which changed those bytes on
+# every checkout and made untouched migrations look edited. The loader now
+# normalises line endings before hashing; this file keeps the working tree
+# itself consistent so the SQL that executes is byte-identical everywhere too.
+*.sql   text eol=lf
+*.ts    text eol=lf
+*.prisma text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+
+# Binary assets — never touched.
+*.png   binary
+*.pdf   binary
