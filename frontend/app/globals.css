@@ -1,0 +1,268 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ONE TOKEN SOURCE. Every colour is an RGB channel triplet ("R G B"), so Tailwind can apply
+   opacity (`bg-primary/90`) and every layer reads the same variables:
+   - the BRAND palette (--angaza-*), from brand-kit/07_Palette_And_Design_Tokens (the same hex
+     values, expressed as channels);
+   - the SEMANTIC set (shadcn/ui's names plus success / warning / danger), which in light mode
+     points AT the brand palette wherever a brand colour is the value, and in dark mode is the
+     AA-checked derivation of it.
+   There is no second palette: Tailwind utilities, shadcn/ui and our components all resolve here. */
+:root {
+  --angaza-primary: 0 96 120; /* #006078 */
+  --angaza-gold: 234 179 6; /* #EAB306 */
+  --angaza-warm: 248 244 239; /* #F8F4EF */
+  --angaza-navy: 15 23 42; /* #0F172A */
+  --angaza-support-teal: 10 125 151; /* #0A7D97 */
+  --angaza-light-teal: 22 166 171; /* #16A6AB */
+  --angaza-success: 21 130 90; /* #15825A */
+  --angaza-warning: 180 83 9; /* #B45309 */
+  --angaza-danger: 180 35 24; /* #B42318 */
+  --angaza-white: 255 255 255; /* #FFFFFF */
+  --angaza-black: 0 0 0; /* #000000 */
+
+  /* Light theme. */
+  --background: var(--angaza-warm);
+  --foreground: var(--angaza-navy);
+  --card: var(--angaza-white);
+  --card-foreground: var(--angaza-navy);
+  --popover: var(--angaza-white);
+  --popover-foreground: var(--angaza-navy);
+  --primary: var(--angaza-primary); /* white text on it: 7.13:1 */
+  --primary-foreground: var(--angaza-white);
+  --secondary: 238 233 225; /* #EEE9E1 (navy text on it 14.77:1) */
+  --secondary-foreground: var(--angaza-navy);
+  --muted: 238 233 225; /* #EEE9E1 */
+  --muted-foreground: 92 102 117; /* #5C6675: 5.31:1 on background, 4.81:1 on muted */
+  --accent: var(--angaza-gold);
+  --accent-foreground: 35 26 2; /* #231A02: 8.97:1 on gold */
+  --destructive: var(--angaza-danger); /* white text on it: 6.57:1 */
+  --destructive-foreground: var(--angaza-white);
+  --border: 227 223 214; /* #E3DFD6: decorative dividers */
+  --input: 133 126 113; /* #857E71: a form field's edge, 4.02:1 on white, 3.67:1 on background (WCAG 1.4.11) */
+  --ring: var(--angaza-primary); /* the focus ring is the brand primary: 7.13:1 on a card */
+  --success: var(--angaza-success); /* fills, icons, large text */
+  /* Small success text: --success is AA only on white (4.80:1), not on the warm
+     background (4.39:1); this passes on both (5.96:1 / 6.53:1). */
+  --success-text: 14 107 73; /* #0E6B49 */
+  --warning: var(--angaza-warning); /* 4.59:1 on background, 5.02:1 on white */
+  --danger: var(--angaza-danger); /* 6.00:1 on background, 6.57:1 on white */
+  /* Chart series: revenue is the brand teal; net profit the navy, distinct in hue and in shape
+     (bars vs a line with dots). Both clear 3:1 against a card (WCAG 1.4.11). */
+  --chart-revenue: var(--angaza-primary);
+  --chart-net: var(--angaza-navy);
+
+  --radius: 0.625rem;
+
+  color-scheme: light;
+}
+
+/* Dark theme: the brand hues, lightened where needed so every text pair meets WCAG 2.2 AA
+   (4.5:1) on both the background and a card. Applied by the system preference unless the
+   page opts out with .light, and always under .dark. */
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    --background: 11 18 32; /* #0B1220 */
+    --foreground: 233 237 242; /* #E9EDF2 */
+    --card: 18 26 36; /* #121A24 */
+    --card-foreground: 233 237 242;
+    --popover: 18 26 36;
+    --popover-foreground: 233 237 242;
+    --primary: 58 167 190; /* #3AA7BE */
+    --primary-foreground: 6 32 42; /* #06202A: 5.97:1 on primary */
+    --secondary: 30 41 56; /* #1E2938 */
+    --secondary-foreground: 233 237 242;
+    --muted: 30 41 56;
+    --muted-foreground: 148 158 174; /* #949EAE */
+    --accent: var(--angaza-gold);
+    --accent-foreground: 35 26 2;
+    --destructive: 249 112 102; /* #F97066 */
+    --destructive-foreground: 42 10 7; /* #2A0A07: 6.58:1 on destructive */
+    --border: 36 48 64; /* #243040 */
+    --input: 100 113 138; /* #64718A: 3.56:1 on a card */
+    --ring: 58 167 190;
+    --success: 60 185 138; /* #3CB98A */
+    --success-text: 60 185 138;
+    --warning: 245 158 11; /* #F59E0B */
+    --danger: 249 112 102; /* #F97066 */
+    --chart-revenue: 58 167 190; /* the dark primary */
+    --chart-net: var(--angaza-gold);
+
+    color-scheme: dark;
+  }
+}
+
+.dark {
+  --background: 11 18 32;
+  --foreground: 233 237 242;
+  --card: 18 26 36;
+  --card-foreground: 233 237 242;
+  --popover: 18 26 36;
+  --popover-foreground: 233 237 242;
+  --primary: 58 167 190;
+  --primary-foreground: 6 32 42;
+  --secondary: 30 41 56;
+  --secondary-foreground: 233 237 242;
+  --muted: 30 41 56;
+  --muted-foreground: 148 158 174;
+  --accent: var(--angaza-gold);
+  --accent-foreground: 35 26 2;
+  --destructive: 249 112 102;
+  --destructive-foreground: 42 10 7;
+  --border: 36 48 64;
+  --input: 100 113 138;
+  --ring: 58 167 190;
+  --success: 60 185 138;
+  --success-text: 60 185 138;
+  --warning: 245 158 11;
+  --danger: 249 112 102;
+  --chart-revenue: 58 167 190;
+  --chart-net: var(--angaza-gold);
+
+  color-scheme: dark;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body {
+    @apply bg-background text-foreground;
+  }
+
+  body {
+    @apply font-sans antialiased;
+  }
+}
+
+/* Reduced motion: honour the system setting everywhere, not only where a component remembered
+   motion-safe:. Animations and transitions finish at once; nothing scrolls smoothly. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@layer utilities {
+  /* KES amounts line up in columns. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* PRINTING A RECEIPT (POS). Only the receipt prints — the shell, the till and every control are
+   hidden — on a thermal-roll width: 80mm paper with a 72mm printable line, black on white. */
+@media print {
+  @page {
+    size: 80mm auto;
+    margin: 4mm;
+  }
+  body * {
+    visibility: hidden;
+  }
+  .print-area,
+  .print-area * {
+    visibility: visible;
+  }
+  .print-area {
+    position: absolute;
+    inset: 0 auto auto 0;
+    width: 72mm;
+  }
+  .print-area .receipt-slip {
+    max-width: none;
+    border: 0;
+    padding: 0;
+    color: #000;
+    background: #fff;
+  }
+  .no-print {
+    display: none !important;
+  }
+  /* Financial statements and the VAT return print on A4, not on the till's 80mm receipt page. */
+  @page document {
+    size: A4;
+    margin: 15mm;
+  }
+  .print-area.print-document {
+    page: document;
+    position: static;
+    width: 100%;
+    color: #000;
+    background: #fff;
+  }
+  .print-document table {
+    break-inside: auto;
+  }
+  .print-document tr {
+    break-inside: avoid;
+  }
+}
+
+/* THE PUBLIC LANDING PAGE is the brand's first impression, so it always shows the Precision palette:
+   the light semantic tokens are re-declared on its root element (a test keeps them identical to
+   :root's), whatever the visitor's colour-scheme preference, and the page canvas behind it is warm. */
+.landing {
+  --background: var(--angaza-warm);
+  --foreground: var(--angaza-navy);
+  --card: var(--angaza-white);
+  --card-foreground: var(--angaza-navy);
+  --popover: var(--angaza-white);
+  --popover-foreground: var(--angaza-navy);
+  --primary: var(--angaza-primary);
+  --primary-foreground: var(--angaza-white);
+  --secondary: 238 233 225;
+  --secondary-foreground: var(--angaza-navy);
+  --muted: 238 233 225;
+  --muted-foreground: 92 102 117;
+  --accent: var(--angaza-gold);
+  --accent-foreground: 35 26 2;
+  --border: 227 223 214;
+  --input: 133 126 113;
+  --ring: var(--angaza-primary);
+  --success: var(--angaza-success);
+  --success-text: 14 107 73;
+  --warning: var(--angaza-warning);
+  --danger: var(--angaza-danger);
+
+  color-scheme: light;
+}
+
+html:has(.landing),
+html:has(.landing) body {
+  background-color: rgb(var(--angaza-warm));
+  color-scheme: light;
+}
+
+/* The ONE orchestrated entrance: the hero's parts rise in turn (each sets --rise-delay). Nothing
+   else on the page animates. With reduced motion the parts are simply there. */
+@keyframes landing-rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.landing-rise {
+  animation: landing-rise 640ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  animation-delay: var(--rise-delay, 0ms);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .landing-rise {
+    animation: none;
+  }
+}

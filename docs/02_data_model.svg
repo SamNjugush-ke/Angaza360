@@ -1,0 +1,237 @@
+<svg viewBox="0 0 1180 1000" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <style>
+      .title { fill:#0F172A; font-size:24px; font-weight:800; }
+      .sub { fill:#5b6472; font-size:13px; }
+      .schemabox { fill:#F8F4EF; stroke:#0F766E; stroke-width:1.5; }
+      .schemalabel { fill:#0F766E; font-size:15px; font-weight:700; }
+      .ent { fill:#ffffff; stroke:#0F172A; stroke-width:1.1; }
+      .entbuilt { fill:#ffffff; stroke:#0F766E; stroke-width:1.6; }
+      .enth { font-size:12px; font-weight:700; fill:#0F172A; }
+      .entf { font-size:10px; fill:#5b6472; }
+      .rel { stroke:#8a94a6; stroke-width:1.1; fill:none; }
+      .relkey { stroke:#0F766E; stroke-width:1.4; fill:none; }
+      .note { fill:#8a6d0b; font-size:11px; font-style:italic; }
+      .tag { font-size:8.5px; font-weight:700; fill:#ffffff; }
+      .built { fill:#0F766E; }
+      .next { fill:#c2410c; }
+      .def { fill:#EAB308; }
+      .legendt { fill:#0F172A; font-size:11px; }
+    </style>
+  </defs>
+
+  <text x="40" y="42" class="title">Angaza360 — Data Model &amp; Schema Isolation</text>
+  <text x="40" y="64" class="sub">Dual Prisma topology · one shared registry schema + one isolated schema per tenant · teal outline = already built</text>
+
+  <rect x="760" y="26" width="14" height="12" rx="2" class="built"/><text x="780" y="36" class="legendt">Built (Phase 0–3.3)</text>
+  <rect x="760" y="44" width="14" height="12" rx="2" class="next"/><text x="780" y="54" class="legendt">Next (3.4 / 4.1)</text>
+  <rect x="900" y="26" width="14" height="12" rx="2" class="def"/><text x="920" y="36" class="legendt">Deferred (plug ready)</text>
+
+  <!-- PUBLIC / PLATFORM SCHEMA -->
+  <rect x="40" y="84" width="1100" height="250" class="schemabox" rx="10"/>
+  <text x="56" y="106" class="schemalabel">public — PLATFORM REGISTRY  (one, shared; resolvable before any tenant schema is chosen)</text>
+
+  <!-- Tenant -->
+  <rect x="60" y="120" width="180" height="120" class="entbuilt" rx="6"/>
+  <rect x="60" y="120" width="30" height="14" rx="3" class="built"/><text x="66" y="130" class="tag">DONE</text>
+  <text x="150" y="132" class="enth" text-anchor="middle">Tenant</text>
+  <line x1="60" y1="138" x2="240" y2="138" stroke="#e2e2e2"/>
+  <text x="70" y="153" class="entf">id · name · subdomain (unique)</text>
+  <text x="70" y="167" class="entf">dbSchema (unique) · isolationTier</text>
+  <text x="70" y="181" class="entf">status · subscriptionTier / status</text>
+  <text x="70" y="195" class="entf">kraPin · taxRegime · currency</text>
+  <text x="70" y="209" class="entf">brand colour / logo · donorCode</text>
+  <text x="70" y="228" class="entf" font-style="italic">→ users, subscriptions</text>
+
+  <!-- User -->
+  <rect x="280" y="120" width="180" height="120" class="entbuilt" rx="6"/>
+  <rect x="280" y="120" width="30" height="14" rx="3" class="built"/><text x="286" y="130" class="tag">DONE</text>
+  <text x="370" y="132" class="enth" text-anchor="middle">User</text>
+  <line x1="280" y1="138" x2="460" y2="138" stroke="#e2e2e2"/>
+  <text x="290" y="153" class="entf">id · tenantId (nullable = Angaza)</text>
+  <text x="290" y="167" class="entf">email · phone · authUid?</text>
+  <text x="290" y="181" class="entf">passwordHash? · role (9)</text>
+  <text x="290" y="195" class="entf">mfaEnabled · isActive</text>
+  <text x="290" y="228" class="entf" font-style="italic">→ sessions</text>
+
+  <!-- Session -->
+  <rect x="500" y="120" width="160" height="120" class="entbuilt" rx="6"/>
+  <rect x="500" y="120" width="30" height="14" rx="3" class="built"/><text x="506" y="130" class="tag">DONE</text>
+  <text x="580" y="132" class="enth" text-anchor="middle">Session</text>
+  <line x1="500" y1="138" x2="660" y2="138" stroke="#e2e2e2"/>
+  <text x="510" y="153" class="entf">id · userId</text>
+  <text x="510" y="167" class="entf">refreshTokenHash</text>
+  <text x="510" y="181" class="entf">expiresAt · revokedAt</text>
+  <text x="510" y="195" class="entf">userAgent · ip</text>
+
+  <!-- Subscription / DonorProject (deferred) -->
+  <rect x="700" y="120" width="180" height="56" class="ent" rx="6"/>
+  <rect x="700" y="120" width="28" height="14" rx="3" class="def"/><text x="705" y="130" class="tag">DEF</text>
+  <text x="790" y="140" class="enth" text-anchor="middle">Subscription</text>
+  <text x="710" y="160" class="entf">plan · period · billing dates</text>
+
+  <rect x="700" y="184" width="180" height="56" class="ent" rx="6"/>
+  <rect x="700" y="184" width="28" height="14" rx="3" class="def"/><text x="705" y="194" class="tag">DEF</text>
+  <text x="790" y="204" class="enth" text-anchor="middle">DonorProject</text>
+  <text x="710" y="224" class="entf">donor · budget · cohort · modules</text>
+
+  <!-- Angaza platform credentials (3.4) -->
+  <rect x="920" y="120" width="200" height="120" class="ent" rx="6" stroke="#c2410c" stroke-width="1.6"/>
+  <rect x="920" y="120" width="30" height="14" rx="3" class="next"/><text x="926" y="130" class="tag">3.4</text>
+  <text x="1020" y="132" class="enth" text-anchor="middle">PlatformCredential</text>
+  <line x1="920" y1="138" x2="1120" y2="138" stroke="#e2e2e2"/>
+  <text x="930" y="153" class="entf">provider (MPESA / STRIPE…)</text>
+  <text x="930" y="167" class="entf">environment (sandbox/prod)</text>
+  <text x="930" y="181" class="entf">encryptedBlob · keyRef</text>
+  <text x="930" y="195" class="entf">status · activeFrom</text>
+  <text x="930" y="216" class="note" font-size="9.5">Angaza's OWN shortcode +</text>
+  <text x="930" y="229" class="note" font-size="9.5">integrator creds (subscriptions)</text>
+
+  <line class="relkey" x1="240" y1="180" x2="280" y2="180"/>
+  <line class="rel" x1="460" y1="180" x2="500" y2="180"/>
+
+  <!-- TENANT SCHEMA -->
+  <rect x="40" y="352" width="1100" height="600" class="schemabox" rx="10"/>
+  <text x="56" y="374" class="schemalabel">tenant_&lt;slug&gt; — ISOLATED PER MSME  (identical structure, deployed by the provisioner into every tenant schema)</text>
+
+  <!-- Financial core cluster -->
+  <text x="60" y="398" class="schemalabel" font-size="12" fill="#0F172A">FINANCIAL CORE (built)</text>
+
+  <rect x="60" y="408" width="170" height="92" class="entbuilt" rx="6"/>
+  <rect x="60" y="408" width="30" height="14" rx="3" class="built"/><text x="66" y="418" class="tag">DONE</text>
+  <text x="145" y="420" class="enth" text-anchor="middle">Account</text>
+  <line x1="60" y1="426" x2="230" y2="426" stroke="#e2e2e2"/>
+  <text x="70" y="440" class="entf">code (unique) · name</text>
+  <text x="70" y="454" class="entf">accountClass · normalBalance</text>
+  <text x="70" y="468" class="entf">isSystem · isActive</text>
+  <text x="70" y="488" class="entf" font-style="italic">44 accounts, incl 1015 clearing</text>
+
+  <rect x="260" y="408" width="170" height="92" class="entbuilt" rx="6"/>
+  <rect x="260" y="408" width="30" height="14" rx="3" class="built"/><text x="266" y="418" class="tag">DONE</text>
+  <text x="345" y="420" class="enth" text-anchor="middle">JournalEntry</text>
+  <line x1="260" y1="426" x2="430" y2="426" stroke="#e2e2e2"/>
+  <text x="270" y="440" class="entf">entryNumber · entryDate</text>
+  <text x="270" y="454" class="entf">source · sourceId · status</text>
+  <text x="270" y="468" class="entf">reverses / reversedBy</text>
+  <text x="270" y="488" class="entf" font-style="italic">immutable · period-locked</text>
+
+  <rect x="460" y="408" width="150" height="92" class="entbuilt" rx="6"/>
+  <rect x="460" y="408" width="30" height="14" rx="3" class="built"/><text x="466" y="418" class="tag">DONE</text>
+  <text x="535" y="420" class="enth" text-anchor="middle">JournalLine</text>
+  <line x1="460" y1="426" x2="610" y2="426" stroke="#e2e2e2"/>
+  <text x="470" y="440" class="entf">accountId · debit</text>
+  <text x="470" y="454" class="entf">credit · memo</text>
+  <text x="470" y="468" class="entf">lineNumber</text>
+  <text x="470" y="488" class="entf" font-style="italic">Σdebit=Σcredit (DB)</text>
+
+  <rect x="640" y="408" width="150" height="92" class="entbuilt" rx="6"/>
+  <rect x="640" y="408" width="30" height="14" rx="3" class="built"/><text x="646" y="418" class="tag">DONE</text>
+  <text x="715" y="420" class="enth" text-anchor="middle">AccountingPeriod</text>
+  <line x1="640" y1="426" x2="790" y2="426" stroke="#e2e2e2"/>
+  <text x="650" y="440" class="entf">year · month (unique)</text>
+  <text x="650" y="454" class="entf">status (OPEN/CLOSED)</text>
+  <text x="650" y="468" class="entf">closedAt · closedBy</text>
+
+  <line class="relkey" x1="230" y1="454" x2="260" y2="454"/>
+  <line class="relkey" x1="430" y1="454" x2="460" y2="454"/>
+
+  <!-- Inventory + POS cluster -->
+  <text x="60" y="528" class="schemalabel" font-size="12" fill="#0F172A">INVENTORY &amp; POS (built)</text>
+
+  <rect x="60" y="538" width="150" height="86" class="entbuilt" rx="6"/>
+  <rect x="60" y="538" width="30" height="14" rx="3" class="built"/><text x="66" y="548" class="tag">DONE</text>
+  <text x="135" y="550" class="enth" text-anchor="middle">Product</text>
+  <line x1="60" y1="556" x2="210" y2="556" stroke="#e2e2e2"/>
+  <text x="70" y="570" class="entf">sku · name · price · cost</text>
+  <text x="70" y="584" class="entf">stockCount · avgCost</text>
+  <text x="70" y="598" class="entf">stockValue · taxRate</text>
+  <text x="70" y="616" class="entf" font-style="italic">money = BigInt cents</text>
+
+  <rect x="240" y="538" width="160" height="86" class="entbuilt" rx="6"/>
+  <rect x="240" y="538" width="30" height="14" rx="3" class="built"/><text x="246" y="548" class="tag">DONE</text>
+  <text x="320" y="550" class="enth" text-anchor="middle">StockMovement</text>
+  <line x1="240" y1="556" x2="400" y2="556" stroke="#e2e2e2"/>
+  <text x="250" y="570" class="entf">type · qty · unitCost</text>
+  <text x="250" y="584" class="entf">balance* · journalEntryId</text>
+  <text x="250" y="598" class="entf">locationId? (NULL=MAIN)</text>
+  <text x="250" y="616" class="entf" font-style="italic">immutable</text>
+
+  <rect x="430" y="538" width="130" height="86" class="entbuilt" rx="6"/>
+  <rect x="430" y="538" width="30" height="14" rx="3" class="built"/><text x="436" y="548" class="tag">DONE</text>
+  <text x="495" y="550" class="enth" text-anchor="middle">Sale</text>
+  <line x1="430" y1="556" x2="560" y2="556" stroke="#e2e2e2"/>
+  <text x="440" y="570" class="entf">saleNumber · totals</text>
+  <text x="440" y="584" class="entf">status · paymentStatus</text>
+  <text x="440" y="598" class="entf">fiscalStatus (eTIMS)</text>
+  <text x="440" y="616" class="entf" font-style="italic">→ lines, tenders</text>
+
+  <rect x="590" y="538" width="120" height="40" class="entbuilt" rx="6"/>
+  <text x="650" y="562" class="enth" text-anchor="middle">SaleLine</text>
+  <rect x="590" y="584" width="120" height="40" class="entbuilt" rx="6"/>
+  <text x="650" y="608" class="enth" text-anchor="middle">SaleTender</text>
+
+  <rect x="730" y="538" width="120" height="40" class="entbuilt" rx="6"/>
+  <text x="790" y="562" class="enth" text-anchor="middle">Shift</text>
+  <rect x="730" y="584" width="120" height="40" class="entbuilt" rx="6"/>
+  <text x="790" y="608" class="enth" text-anchor="middle">Customer</text>
+
+  <rect x="870" y="538" width="160" height="86" class="entbuilt" rx="6"/>
+  <rect x="870" y="538" width="30" height="14" rx="3" class="built"/><text x="876" y="548" class="tag">DONE</text>
+  <text x="950" y="550" class="enth" text-anchor="middle">MpesaTransaction</text>
+  <line x1="870" y1="556" x2="1030" y2="556" stroke="#e2e2e2"/>
+  <text x="880" y="570" class="entf">checkoutRequestId (uniq)</text>
+  <text x="880" y="584" class="entf">status · receipt · amount</text>
+  <text x="880" y="598" class="entf">confirmation / reversal Eid</text>
+  <text x="880" y="616" class="entf" font-style="italic">terminal-state idempotent</text>
+
+  <line class="relkey" x1="210" y1="580" x2="240" y2="580"/>
+  <line class="relkey" x1="400" y1="580" x2="430" y2="580"/>
+  <line class="relkey" x1="560" y1="562" x2="590" y2="558"/>
+  <line class="relkey" x1="560" y1="600" x2="590" y2="604"/>
+
+  <!-- NEXT: credential store + eTIMS -->
+  <text x="60" y="654" class="schemalabel" font-size="12" fill="#0F172A">PER-TENANT INTEGRATIONS (3.4 / 4.1) — the foundation this blueprint is about</text>
+
+  <rect x="60" y="664" width="230" height="120" class="ent" rx="6" stroke="#c2410c" stroke-width="1.8"/>
+  <rect x="60" y="664" width="30" height="14" rx="3" class="next"/><text x="66" y="674" class="tag">3.4</text>
+  <text x="175" y="676" class="enth" text-anchor="middle">TenantIntegrationCredential</text>
+  <line x1="60" y1="682" x2="290" y2="682" stroke="#e2e2e2"/>
+  <text x="70" y="697" class="entf">provider (MPESA / ETIMS / …)</text>
+  <text x="70" y="711" class="entf">environment (sandbox / production)</text>
+  <text x="70" y="725" class="entf">encryptedBlob (AES-256-GCM)</text>
+  <text x="70" y="739" class="entf">keyRef · status · activeFrom</text>
+  <text x="70" y="753" class="entf">@@unique(provider, environment)</text>
+  <text x="70" y="772" class="note" font-size="9.5">one row per provider × env · scale-up = new row</text>
+
+  <rect x="320" y="664" width="200" height="120" class="ent" rx="6" stroke="#EAB308" stroke-width="1.6"/>
+  <rect x="320" y="664" width="28" height="14" rx="3" class="def"/><text x="325" y="674" class="tag">4.1</text>
+  <text x="420" y="676" class="enth" text-anchor="middle">EtimsInvoice</text>
+  <line x1="320" y1="682" x2="520" y2="682" stroke="#e2e2e2"/>
+  <text x="330" y="697" class="entf">saleId · status</text>
+  <text x="330" y="711" class="entf">kraInvoiceNumber · qrCode</text>
+  <text x="330" y="725" class="entf">scuId · signature</text>
+  <text x="330" y="739" class="entf">submittedAt · retryCount</text>
+  <text x="330" y="758" class="note" font-size="9.5">signs under the TENANT's own KRA PIN,</text>
+  <text x="330" y="771" class="note" font-size="9.5">from the credential store — not Angaza's</text>
+
+  <!-- deferred cluster -->
+  <text x="560" y="654" class="schemalabel" font-size="12" fill="#0F172A">DEFERRED (plug ready)</text>
+  <rect x="560" y="664" width="130" height="34" class="ent" rx="5"/><text x="625" y="685" class="enth" text-anchor="middle" font-size="11">Supplier / PO</text>
+  <rect x="700" y="664" width="130" height="34" class="ent" rx="5"/><text x="765" y="685" class="enth" text-anchor="middle" font-size="11">Employee/Payroll</text>
+  <rect x="840" y="664" width="130" height="34" class="ent" rx="5"/><text x="905" y="685" class="enth" text-anchor="middle" font-size="11">Location (multi)</text>
+  <rect x="980" y="664" width="140" height="34" class="ent" rx="5"/><text x="1050" y="685" class="enth" text-anchor="middle" font-size="11">StatutoryRate (dated)</text>
+  <rect x="560" y="706" width="130" height="34" class="ent" rx="5"/><text x="625" y="727" class="enth" text-anchor="middle" font-size="11">B2B Listing</text>
+  <rect x="700" y="706" width="130" height="34" class="ent" rx="5"/><text x="765" y="727" class="enth" text-anchor="middle" font-size="11">TrustScore</text>
+  <rect x="840" y="706" width="130" height="34" class="ent" rx="5"/><text x="905" y="727" class="enth" text-anchor="middle" font-size="11">StoreOrder</text>
+  <rect x="980" y="706" width="140" height="34" class="ent" rx="5"/><text x="1050" y="727" class="enth" text-anchor="middle" font-size="11">AiConversation</text>
+  <rect x="560" y="748" width="130" height="34" class="ent" rx="5"/><text x="625" y="769" class="enth" text-anchor="middle" font-size="11">ProductLocationStock</text>
+
+  <text x="60" y="812" class="note">The credential store is per-tenant and encrypted: Nakuru's M-Pesa shortcode and KRA PIN live in tenant_nakuru_hardware; Thika's in tenant_thika_agrovet. A provider is</text>
+  <text x="60" y="830" class="note">constructed per request from the resolving tenant's ACTIVE row — the same MpesaProvider / EtimsProvider interface, only the credentials differ. Angaza's own creds live in public.</text>
+  <text x="60" y="854" class="note" fill="#0F766E" font-size="12" font-weight="700">Scale-up rule made visible: switching a tenant from sandbox → production is inserting/activating one credential row. No schema change, no data migration, appears as a new "Go Live" button.</text>
+
+  <!-- provider layer band -->
+  <rect x="60" y="874" width="1060" height="60" fill="#ffffff" stroke="#0F766E" stroke-width="1.4" rx="8"/>
+  <text x="80" y="898" class="enth" fill="#0F766E">Provider layer (application, not schema)</text>
+  <text x="80" y="918" class="entf" font-size="11">factory(tenant, provider, env) → decrypt credential blob → construct SimulatedProvider (dev) or Real{Daraja|OSCU|Stripe}Provider (config swap). Reconciliation / idempotency / ledger code depends only on the interface.</text>
+</svg>

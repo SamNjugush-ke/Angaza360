@@ -1,0 +1,117 @@
+<svg viewBox="0 0 1240 880" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <style>
+      .title{fill:#0F172A;font-size:23px;font-weight:800;}
+      .sub{fill:#5b6472;font-size:13px;}
+      .main{fill:#E7F5F3;stroke:#0F766E;stroke-width:2;}
+      .pos{fill:#FEF6E7;stroke:#EAB308;stroke-width:1.8;}
+      .ecom{fill:#EAF1FB;stroke:#3b6bc4;stroke-width:1.8;}
+      .plug{fill:#f4f4f5;stroke:#a1a1aa;stroke-width:1.3;stroke-dasharray:4 3;}
+      .frozen{fill:#FBECEC;stroke:#c0392b;stroke-width:1.6;}
+      .h{font-size:14px;font-weight:700;fill:#0F172A;}
+      .lt{font-size:12.5px;font-weight:700;fill:#0F172A;}
+      .ls{font-size:10.5px;fill:#5b6472;}
+      .qty{font-size:15px;font-weight:800;}
+      .fl{stroke:#0F766E;stroke-width:2;fill:none;marker-end:url(#a);}
+      .flr{stroke:#c0392b;stroke-width:1.7;fill:none;marker-end:url(#ar);stroke-dasharray:5 3;}
+      .flb{stroke:#b8860b;stroke-width:1.7;fill:none;marker-end:url(#ab);}
+      .lbl{fill:#0F766E;font-size:11px;font-weight:600;}
+      .lblr{fill:#c0392b;font-size:10.5px;font-style:italic;}
+      .note{fill:#8a6d0b;font-size:11px;font-style:italic;}
+      .tag{font-size:9px;font-weight:700;fill:#fff;}
+      .badge{font-size:9.5px;font-weight:700;}
+    </style>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#0F766E"/></marker>
+    <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#c0392b"/></marker>
+    <marker id="ab" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#b8860b"/></marker>
+  </defs>
+
+  <text x="40" y="40" class="title">Stock is Location-Owned — the unified model (multi-location = offline foundation)</text>
+  <text x="40" y="62" class="sub">Every location owns its stock exclusively. Nothing sells stock it doesn't own — so no two channels ever contend. Offline falls out of this for free.</text>
+
+  <!-- MAIN -->
+  <rect x="440" y="90" width="300" height="120" class="main" rx="10"/>
+  <rect x="440" y="90" width="150" height="18" rx="4" fill="#0F766E"/><text x="450" y="103" class="tag">MAIN WAREHOUSE</text>
+  <text x="590" y="132" class="lt" text-anchor="middle">Main Inventory</text>
+  <text x="590" y="152" class="ls" text-anchor="middle">the authoritative pool · the only place</text>
+  <text x="590" y="166" class="ls" text-anchor="middle">stock enters (purchases) and the</text>
+  <text x="590" y="180" class="ls" text-anchor="middle">default home for everything unallocated</text>
+  <text x="590" y="200" class="qty" text-anchor="middle" fill="#0F766E">Cement: 30 available</text>
+
+  <!-- transfers down -->
+  <path class="fl" d="M500 210 L300 268"/>
+  <path class="fl" d="M590 210 L590 268"/>
+  <path class="fl" d="M690 210 L890 268"/>
+  <text x="360" y="245" class="lbl">transfer / allocate</text>
+  <text x="900" y="245" class="lbl">transfer / allocate</text>
+
+  <!-- POS location -->
+  <rect x="150" y="272" width="300" height="150" class="pos" rx="10"/>
+  <rect x="150" y="272" width="150" height="18" rx="4" fill="#EAB308"/><text x="160" y="285" class="tag">POS TILL — offline-capable</text>
+  <text x="300" y="314" class="lt" text-anchor="middle">POS Location (Till 1)</text>
+  <text x="300" y="334" class="qty" text-anchor="middle" fill="#b8860b">Cement: 20 owned</text>
+  <text x="300" y="356" class="ls" text-anchor="middle">sells its OWN 20 with no internet — no</text>
+  <text x="300" y="370" class="ls" text-anchor="middle">one else can touch them. Hard-stop at 0:</text>
+  <text x="300" y="384" class="ls" text-anchor="middle">"insufficient stock — request more"</text>
+  <text x="300" y="406" class="ls" text-anchor="middle" font-weight="700">lease window: admin-set (default 8h)</text>
+
+  <!-- E-COMMERCE location -->
+  <rect x="740" y="272" width="300" height="150" class="ecom" rx="10"/>
+  <rect x="740" y="272" width="150" height="18" rx="4" fill="#3b6bc4"/><text x="750" y="285" class="tag">E-COMMERCE — always online</text>
+  <text x="890" y="314" class="lt" text-anchor="middle">E-commerce Location</text>
+  <text x="890" y="334" class="qty" text-anchor="middle" fill="#3b6bc4">Cement: 10 owned</text>
+  <text x="890" y="356" class="ls" text-anchor="middle">storefront sells ONLY its 10. When they're</text>
+  <text x="890" y="370" class="ls" text-anchor="middle">gone the product shows OUT OF STOCK</text>
+  <text x="890" y="384" class="ls" text-anchor="middle">online — it can never sell the till's 20</text>
+  <text x="890" y="406" class="ls" text-anchor="middle" font-weight="700">no lease/freeze — it's always online</text>
+
+  <!-- the coexistence proof -->
+  <rect x="150" y="446" width="890" height="52" fill="#fbfaf6" stroke="#0F766E" stroke-width="1.3" rx="8"/>
+  <text x="168" y="468" class="h" fill="#0F766E">The e-commerce coexistence proof</text>
+  <text x="168" y="486" class="ls">Walk-in buys the last till bag AND an online shopper checks out — impossible to conflict: the till sells from its 20, the storefront from its 10. 20 + 10 = 30, never 31.</text>
+
+  <!-- request more allocation -->
+  <path class="flb" d="M300 422 L300 512"/>
+  <rect x="150" y="516" width="300" height="72" class="pos" rx="8"/>
+  <text x="300" y="538" class="lt" text-anchor="middle" font-size="12">Attendant requests more</text>
+  <text x="300" y="556" class="ls" text-anchor="middle">"Cement running low — request 15 more"</text>
+  <text x="300" y="572" class="ls" text-anchor="middle">→ admin approves / edits / declines → transfer</text>
+  <path class="flb" d="M300 516 L300 428" transform="translate(40,0)"/>
+  <text x="345" y="470" class="badge" fill="#b8860b">request ↑</text>
+
+  <!-- admin + alerts -->
+  <rect x="490" y="516" width="250" height="72" class="main" rx="8"/>
+  <text x="615" y="538" class="lt" text-anchor="middle" font-size="12">Inventory Admin</text>
+  <text x="615" y="556" class="ls" text-anchor="middle">approves transfers · gets low-stock &amp;</text>
+  <text x="615" y="572" class="ls" text-anchor="middle">unsynced-lease alerts · sets lease windows</text>
+
+  <!-- AI plug -->
+  <rect x="780" y="516" width="260" height="72" class="plug" rx="8"/>
+  <rect x="780" y="516" width="60" height="16" rx="3" fill="#a1a1aa"/><text x="787" y="528" class="tag">AI · DEFERRED</text>
+  <text x="910" y="546" class="lt" text-anchor="middle" font-size="12">AI allocation advisor</text>
+  <text x="910" y="564" class="ls" text-anchor="middle">"3 bags, 5 demand points — allocate to</text>
+  <text x="910" y="578" class="ls" text-anchor="middle">minimise lost sales" · velocity-driven</text>
+
+  <!-- FROZEN path -->
+  <path class="flr" d="M230 422 L230 620"/>
+  <rect x="150" y="624" width="470" height="96" class="frozen" rx="8"/>
+  <rect x="150" y="624" width="200" height="18" rx="4" fill="#c0392b"/><text x="160" y="637" class="tag">LEASE EXPIRED, DEVICE NEVER SYNCED</text>
+  <text x="385" y="662" class="lt" text-anchor="middle" fill="#c0392b">PENDING_RECONCILIATION (frozen)</text>
+  <text x="385" y="682" class="ls" text-anchor="middle">unsold allocation is FROZEN — removed from the till's active</text>
+  <text x="385" y="696" class="ls" text-anchor="middle">allocation, but NOT returned to sellable Main (we don't know what</text>
+  <text x="385" y="710" class="ls" text-anchor="middle">was sold). Released only by: device finally syncs, OR admin write-off.</text>
+
+  <rect x="650" y="624" width="390" height="96" class="main" rx="8"/>
+  <text x="845" y="648" class="lt" text-anchor="middle">Why freezing is safe, not lost</text>
+  <text x="845" y="668" class="ls" text-anchor="middle">The server REFUSES TO GUESS what an offline device sold.</text>
+  <text x="845" y="684" class="ls" text-anchor="middle">Auto-returning stock could oversell; keeping it locked forever could</text>
+  <text x="845" y="700" class="ls" text-anchor="middle">strand a stolen till. Freeze + one-click admin write-off is the only</text>
+  <text x="845" y="714" class="ls" text-anchor="middle">honest resolution. Books never corrupt; worst case is a business decision.</text>
+
+  <!-- reports / stock take -->
+  <rect x="150" y="740" width="890" height="60" class="plug" rx="8" stroke="#0F766E"/>
+  <text x="168" y="762" class="h" fill="#0F766E">Reports &amp; stock-take (from immutable movement history)</text>
+  <text x="168" y="782" class="ls">Every transfer is an immutable StockMovement, so stock-take reconciles per location (Main / Till / E-com / branch) and in total, and sales analysis rolls up by point of sale. Moving stock between locations never loses history.</text>
+
+  <text x="150" y="826" class="note" font-weight="700" fill="#0F766E">One model, many payoffs: multi-location warehousing, conflict-free offline POS, e-commerce stock separation, per-location reporting, and an AI seam — all from "stock is location-owned."</text>
+</svg>

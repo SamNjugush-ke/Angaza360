@@ -1,0 +1,108 @@
+<svg viewBox="0 0 1180 800" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <style>
+      .title{fill:#0F172A;font-size:23px;font-weight:800;}
+      .sub{fill:#5b6472;font-size:13px;}
+      .s{fill:#fff;stroke:#0F172A;stroke-width:1.3;}
+      .son{fill:#E7F5F3;stroke:#0F766E;stroke-width:1.5;}
+      .soff{fill:#FEF6E7;stroke:#EAB308;stroke-width:1.6;}
+      .sfrz{fill:#FBECEC;stroke:#c0392b;stroke-width:1.5;}
+      .sd{fill:#eef2f7;stroke:#5b6472;stroke-width:1.3;}
+      .st{font-size:12.5px;font-weight:700;fill:#0F172A;}
+      .ss{font-size:10.5px;fill:#5b6472;}
+      .fl{stroke:#0F766E;stroke-width:1.7;fill:none;marker-end:url(#a);}
+      .flb{stroke:#b8860b;stroke-width:1.7;fill:none;marker-end:url(#ab);}
+      .flr{stroke:#c0392b;stroke-width:1.6;fill:none;marker-end:url(#ar);stroke-dasharray:5 3;}
+      .lbl{fill:#0F766E;font-size:10.5px;font-weight:600;}
+      .lblb{fill:#b8860b;font-size:10.5px;font-weight:600;}
+      .lblr{fill:#c0392b;font-size:10.5px;font-style:italic;}
+      .note{fill:#8a6d0b;font-size:11px;font-style:italic;}
+    </style>
+    <marker id="a" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#0F766E"/></marker>
+    <marker id="ab" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#b8860b"/></marker>
+    <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#c0392b"/></marker>
+  </defs>
+
+  <text x="40" y="40" class="title">Allocation &amp; Lease Lifecycle — how stock reaches a till and safely comes back</text>
+  <text x="40" y="62" class="sub">The lease window is admin-set per location (hours, days, or forever; default 8h). Every path keeps the books correct without the owner touching a technical problem.</text>
+
+  <rect x="60" y="96" width="210" height="70" class="son" rx="8"/>
+  <text x="165" y="124" class="st" text-anchor="middle">ALLOCATED</text>
+  <text x="165" y="142" class="ss" text-anchor="middle">admin transfers N units Main→Till.</text>
+  <text x="165" y="156" class="ss" text-anchor="middle">Main ↓ N, Till owns N. Immutable movement.</text>
+
+  <rect x="340" y="96" width="210" height="70" class="soff" rx="8"/>
+  <text x="445" y="120" class="st" text-anchor="middle">LEASE ACTIVE (selling)</text>
+  <text x="445" y="138" class="ss" text-anchor="middle">till sells its N offline · lease clock</text>
+  <text x="445" y="152" class="ss" text-anchor="middle">running (admin-set window)</text>
+
+  <path class="fl" d="M270 131 L340 131"/>
+
+  <!-- hard stop -->
+  <rect x="340" y="200" width="210" height="58" class="s" rx="8"/>
+  <text x="445" y="223" class="st" text-anchor="middle" font-size="11">HARD STOP at 0 owned</text>
+  <text x="445" y="240" class="ss" text-anchor="middle">"insufficient stock — request more."</text>
+  <text x="445" y="253" class="ss" text-anchor="middle">Item cannot sell until replenished.</text>
+  <path class="flb" d="M445 166 L445 200"/><text x="455" y="186" class="lblb">sells out</text>
+
+  <!-- request loop -->
+  <rect x="60" y="200" width="210" height="58" class="soff" rx="8"/>
+  <text x="165" y="223" class="st" text-anchor="middle" font-size="11">REQUEST MORE</text>
+  <text x="165" y="240" class="ss" text-anchor="middle">attendant asks; admin approves/edits</text>
+  <text x="165" y="253" class="ss" text-anchor="middle">→ new allocation transfer</text>
+  <path class="flb" d="M340 229 L270 229"/>
+  <path class="fl" d="M165 200 L165 166"/><text x="120" y="186" class="lbl">re-allocate</text>
+
+  <!-- two outcomes at end of lease -->
+  <path class="fl" d="M445 166 L445 175 L680 175 L680 300"/>
+  <text x="520" y="167" class="lbl">lease window ends →</text>
+
+  <!-- synced before expiry -->
+  <rect x="575" y="300" width="240" height="80" class="son" rx="8"/>
+  <text x="695" y="324" class="st" text-anchor="middle">SYNCED (in time)</text>
+  <text x="695" y="342" class="ss" text-anchor="middle">device reports: sold X, unsold N−X.</text>
+  <text x="695" y="356" class="ss" text-anchor="middle">Server posts X sales (dated to business</text>
+  <text x="695" y="370" class="ss" text-anchor="middle">time), returns N−X to Main. Clean.</text>
+
+  <!-- proactive warning -->
+  <rect x="880" y="300" width="240" height="80" class="soff" rx="8"/>
+  <text x="1000" y="324" class="st" text-anchor="middle">PROACTIVE WARNING</text>
+  <text x="1000" y="342" class="ss" text-anchor="middle">before expiry: "sync within 1h to keep</text>
+  <text x="1000" y="356" class="ss" text-anchor="middle">selling." The device nags early, so</text>
+  <text x="1000" y="370" class="ss" text-anchor="middle">freezing is the rare exception.</text>
+  <path class="flb" d="M815 340 L880 340"/>
+
+  <path class="fl" d="M680 300 L680 260 L695 260 L695 300"/>
+  <text x="600" y="285" class="lbl">device online</text>
+
+  <!-- expired unsynced -> frozen -->
+  <rect x="340" y="420" width="280" height="90" class="sfrz" rx="8"/>
+  <text x="480" y="444" class="st" text-anchor="middle" fill="#c0392b">LEASE EXPIRED, NOT SYNCED</text>
+  <text x="480" y="464" class="ss" text-anchor="middle">unsold allocation → PENDING_RECONCILIATION.</text>
+  <text x="480" y="478" class="ss" text-anchor="middle">Frozen: not sellable by the till (lease dead),</text>
+  <text x="480" y="492" class="ss" text-anchor="middle">not returned to Main (unknown what sold).</text>
+  <text x="480" y="506" class="ss" text-anchor="middle" font-weight="700" fill="#c0392b">The server refuses to guess.</text>
+  <path class="flr" d="M600 380 L600 400 L480 400 L480 420"/>
+  <text x="500" y="398" class="lblr">expired · still offline</text>
+
+  <!-- two exits from frozen -->
+  <rect x="120" y="560" width="290" height="80" class="son" rx="8"/>
+  <text x="265" y="584" class="st" text-anchor="middle">DEVICE FINALLY SYNCS</text>
+  <text x="265" y="604" class="ss" text-anchor="middle">truth arrives late: sold X (posted at their</text>
+  <text x="265" y="618" class="ss" text-anchor="middle">real business dates), unsold N−X returns</text>
+  <text x="265" y="632" class="ss" text-anchor="middle">to Main. Frozen stock resolved automatically.</text>
+  <path class="fl" d="M400 510 L300 510 L300 560"/>
+  <text x="310" y="536" class="lbl">syncs eventually</text>
+
+  <rect x="560" y="560" width="290" height="80" class="sd" rx="8"/>
+  <text x="705" y="584" class="st" text-anchor="middle">ADMIN WRITE-OFF (one click)</text>
+  <text x="705" y="604" class="ss" text-anchor="middle">device lost/stolen/dead: admin marks the</text>
+  <text x="705" y="618" class="ss" text-anchor="middle">frozen allocation as written off (inventory</text>
+  <text x="705" y="632" class="ss" text-anchor="middle">loss, posts to 5300 write-offs). Books stay right.</text>
+  <path class="fl" d="M560 510 L660 510 L660 560"/>
+  <text x="670" y="536" class="lbl">never recovers</text>
+
+  <text x="120" y="676" class="note">The only human action anywhere in this diagram is easy and business-shaped: approve a transfer, or write off a genuinely lost device. Never a database merge, never a "resolve this conflict."</text>
+  <text x="120" y="700" class="note" font-weight="700" fill="#0F766E">Admin sets the lease window per location. "Forever" = a permanent branch warehouse that never freezes. Short windows = tighter control for a shared till. The policy is theirs; the safety is invariant.</text>
+  <text x="120" y="728" class="note">Because a device warns before expiry and syncs routinely, the frozen path is genuinely rare — it exists for the lost-device case, not the daily case.</text>
+</svg>

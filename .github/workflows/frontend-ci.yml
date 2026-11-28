@@ -1,0 +1,71 @@
+# ===========================================================================
+# Frontend CI (Task F0.2-H) — type-check, lint, test, build and audit the Next.js app.
+#
+# Separate from backend-ci.yml and scoped to frontend/. It needs NO secrets, NO database and
+# NO backend: the tests mock the network, the API types come from the committed OpenAPI spec
+# (lib/api/openapi.json), and the fonts are vendored (app/fonts), so the build reaches nothing
+# outside the npm registry.
+# ===========================================================================
+name: frontend-ci
+
+on:
+  push:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-ci.yml"
+  pull_request:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js (matches local 22.16.0)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.16.0"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # tsconfig includes tests/**, so this one pass type-checks the app AND the test suite.
+      - name: Type-check (app + tests)
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # Requests each public page from the production server: a page can build and pass every
+      # unit test yet answer 500 at runtime (a server component calling a "use client" export).
+      - name: Page-render smoke check
+        run: npm run smoke
+
+      # Production dependencies must be clean; dev-tooling advisories (lint, codegen) never ship.
+      - name: Audit production dependencies (high and above)
+        run: npm audit --omit=dev --audit-level=high
